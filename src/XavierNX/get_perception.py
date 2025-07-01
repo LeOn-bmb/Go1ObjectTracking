@@ -4,8 +4,8 @@ import numpy as np
 import struct
 import time
 
-# Header: uint32 left_size, left_width, left_height, left_type
-HEADER_FORMAT = "IIII"
+# Header: uint32 left_size, left_width, left_height, left_type, depth_size, depth_width, depth_height, depth_type
+HEADER_FORMAT = "IIIIIIII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 # ZeroMQ Server Init
@@ -27,7 +27,7 @@ def get_latest_message(sock):
         try:
             message = sock.recv(flags=zmq.NOBLOCK)
         except zmq.Again:
-            break  # Keine neueren mehr im Puffer
+            break
     return message
 
 while True:
@@ -43,18 +43,17 @@ while True:
             left_size,
             left_width,
             left_height,
-            left_type
-#            depth_size,
-#            depth_width,
-#            depth_height,
-#            depth_type,
+            left_type,
+            depth_size,
+            depth_width,
+            depth_height,
+            depth_type,
     ) = struct.unpack(HEADER_FORMAT, header_data)
 
     # Bilddaten extrahieren
     left_data = message[HEADER_SIZE:HEADER_SIZE + left_size]
-#    depth_data = message[HEADER_SIZE + stereo_size:]
 
-    # Bild-Typ bestimmen (hier: CV_8UC3)
+    # Bild-Typ bestimmen (CV_8UC3)
     if left_type == cv2.CV_8UC3:
         dtype = np.uint8
         img = np.frombuffer(left_data, dtype=dtype).reshape((left_height, left_width, 3))
@@ -62,19 +61,18 @@ while True:
         print(f"Unbekannter left_type: {left_type}")
         continue
 
-    # Depth als Numpy-Array
-#    depth_array = np.frombuffer(depth_data, dtype=np.uint16)
-
-#    depth_height = stereo_img.shape[0]
-#    depth_width = depth_array.size // depth_height
-#    depth_img = depth_array.reshape((depth_height, depth_width))
-
     # Debug-Anzeige
 #    cv2.imshow("Left Frame", img)
 
-    # Optional: Depth normalisieren zum Anzeigen
-#    depth_display = cv2.normalize(depth_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    #cv2.imshow("Depth Image", depth_display)
+#    if depth_size > 0:
+#        # Bilddaten extrahieren
+#        depth_data = message[HEADER_SIZE + left_size:]
+#        depth_img = np.frombuffer(depth_data, dtype=np.uint16).reshape((depth_height, depth_width))
+#
+#        # Depth normalisieren zum Anzeigen und Debug-Anzeige
+#        depth_vis = cv2.normalize(depth_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+#        depth_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+#        cv2.imshow("Depth Frame", depth_colored)
 
     # FPS-Zähler
     frame_count += 1
