@@ -8,7 +8,7 @@ import time
 HEADER_FORMAT = "IIIIIIII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
-# ZeroMQ Server Init
+# --- ZeroMQ Server Init ---
 context = zmq.Context()
 socket = context.socket(zmq.PULL)
 socket.bind("tcp://*:5555")  # auf Verbindung warten
@@ -17,8 +17,12 @@ print("Empfänger bereit...")
 # FPS-Messung Setup
 last_fps_time = time.time()
 frame_count = 0
+fps_outputs = 0# Anzahl der ausgegebenen FPS-Werte
 seconds_elapsed = 0
-fps_outputs = 0     # Anzahl der ausgegebenen FPS-Werte
+# Array-Speicher für FPS-Werte
+fps_list = []
+
+size_printed = 0  #Frame-Size Debug einmalig
 
 # Nur den neuesten Frame verarbeiten
 def get_latest_message(sock):
@@ -60,7 +64,6 @@ while True:
     else:
         print(f"Unbekannter left_type: {left_type}")
         continue
-
     # Debug-Anzeige
 #    cv2.imshow("Left Frame", img)
 
@@ -74,7 +77,12 @@ while True:
 #        depth_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
 #        cv2.imshow("Depth Frame", depth_colored)
 
-    # FPS-Zähler
+    # Frame-Size Debug
+#    if size_printed == 0:
+#        print(f"Left Frame Size: {left_width} x {left_height}")
+#        size_printed = 1
+
+    # --- FPS-Zähler ---
     frame_count += 1
     now = time.time()
     elapsed = now - last_fps_time
@@ -82,16 +90,21 @@ while True:
         seconds_elapsed += 1
         last_fps_time = now
 
-        if seconds_elapsed >= 2 and fps_outputs < 15:
-            print(f"Sekunde {seconds_elapsed - 1}: FPS = {frame_count}")
+        if seconds_elapsed >= 5 and fps_outputs < 15:
+            print(f"Sekunde {seconds_elapsed - 4}: FPS = {frame_count}")
             fps_outputs += 1
-
         frame_count = 0
 
-    # Abbruch
+        # Durchschnitt ausgeben
+        if fps_outputs == 15:
+            avg_fps = sum(fps_list) / len(fps_list)
+            print(f"\n✅ Durchschnittliche FPS über 15 Sekunden: {avg_fps:.2f}")
+            break
+
+    # ESC zum Abbrechen
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
-cv2.destroyAllWindows()
 socket.close()
 context.term()
+cv2.destroyAllWindows()
