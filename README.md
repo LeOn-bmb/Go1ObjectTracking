@@ -10,12 +10,12 @@ Ziel dieses Projekts ist es, den Go1-Roboter von Unitree mit einem Echtzeit-Obje
 
 Dieses Verzeichnis stellt den vollständigen Software-Stack zur Verfügung, um den Go1-Roboter für folgende Aufgaben vorzubereiten:
 
-- Objekterkennung mittels YOLOv8 oder YOLOv11-Modelle (Inference optimiert mit TensorRT für maximale Performance auf Jetson-Plattformen)
+- Objekterkennung mittels YOLO11n-Engine-Model (Inference optimiert mit TensorRT für maximale Performance auf Jetson-Plattformen)
 - Tiefenmessung via Depth-Frames aus der Unitree Kamera (ermöglicht präzise Distanzberechnungen zu erkannten Objekten)
 - Zielverfolgung durch Navigation bis zum Objekt mit aktivem Abstandsregler
 - Modulare Architektur mit ZeroMQ für die Bildübertragung zwischen Kamera-Head (Jetson Nano) und Verarbeitungseinheit (Xavier NX)
 
-Das System wurde für ressourcenbeschränkte Edge-Hardware wie den Jetson Xavier NX optimiert und unterstützt optimierte Objekterkennungs-Modelle über TensorRT.
+Das System wurde für ressourcenbeschränkte Edge-Hardware wie den Jetson Xavier NX optimiert und unterstützt optimierte Objekterkennungs-Modelle über TensorRT. Shape (width, height) nah an RectFrame-Size der Go1 Kamera angepasst und YOLO-Kompatibel (teilbar durch 32).
 
 🔧 2. Build-Time Dependencies (für Modellkonvertierung auf Host/XavierNX, Python 3.8)
 ---
@@ -33,6 +33,10 @@ Das System wurde für ressourcenbeschränkte Edge-Hardware wie den Jetson Xavier
 - CMake (Version 3.11 oder höher) - zum bauen von C-Anwendungen
 - Python3 (Version 3.6 oder höher)
 - [ZeroMQ](https://zeromq.org/get-started/) - leichtgewichtige Messaging-Library (für Bildstreaming vom Jetson Nano zum Xavier NX)
+  
+Nur auf Xavier NX erforderlich für Objekterkennung
+---
+
 - [TensorRT](https://developer.nvidia.com/tensorrt) - NVIDIA-Inferenz-Bibliothek, die speziell für NVIDIA GPUs die maximale Inferenz-Performance aus ONNX-Modellen herausholt (z. B. Version 7.1.3.0 unter JetPack 4.5)
 - [PyCUDA](https://wiki.tiker.net/PyCuda/Installation/Linux/) – nützlich für Memory Binding, CUDA Streams mit TensorRT & Speicherverwaltung in GPU
 

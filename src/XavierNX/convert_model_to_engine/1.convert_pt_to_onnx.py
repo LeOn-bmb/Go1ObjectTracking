@@ -18,7 +18,7 @@ for filename in os.listdir(model_dir):
         print(f"🔄 Konvertiere: {filename}")
         try:
             model = YOLO(pt_path)
-            export_result = model.export(format="onnx", dynamic=False, simplify=True, imgsz=(400, 464), opset=12)
+            export_result = model.export(format="onnx", dynamic=False, simplify=True, imgsz=(416, 480), opset=12)
             if isinstance(export_result, (list, tuple)):
                 exported_path = export_result[0]
             else:
