@@ -1,10 +1,11 @@
+from models.yolov8trt_wrapper import YOLOv8TensorRT
 import zmq
 import cv2
 import numpy as np
 import struct
 import time
 
-# Header: uint32 left_size, left_width, left_height, left_type, depth_size, depth_width, depth_height, depth_type
+# Header: uint32 left_size, left_width, left_height, left_type, right_size, right_width, right_height, right_type
 HEADER_FORMAT = "IIIIIIII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
@@ -14,7 +15,28 @@ socket = context.socket(zmq.PULL)
 socket.bind("tcp://*:5555")  # auf Verbindung warten
 print("Empfänger bereit...")
 
-# FPS-Messung Setup
+# --- Init YOLO-Model ---
+model = YOLOv8TensorRT(
+    engine_path="./models/trained_yolov8n.engine",
+    input_width=480,
+    input_height=416,
+    conf_thresh=0.3,
+    iou_thresh=0.4,
+)
+
+CLASS_NAMES = ["bottle", "can"]
+
+# Funktion um die Bounding Boxes zu zeichnen
+def draw_detections(left_img, detections, class_names):
+    for det in detections:
+        x1, y1, x2, y2, conf, cls_id = det
+        label = f"{class_names[int(cls_id)]}: {conf:.2f}"
+        cv2.rectangle(left_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+        cv2.putText(left_img, label, (int(x1), int(y1) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    return left_img
+
+# --- FPS-Messung Setup ---
 last_fps_time = time.time()
 frame_count = 0
 fps_outputs = 0# Anzahl der ausgegebenen FPS-Werte
@@ -48,38 +70,58 @@ while True:
             left_width,
             left_height,
             left_type,
-            depth_size,
-            depth_width,
-            depth_height,
-            depth_type,
+            right_size,
+            right_width,
+            right_height,
+            right_type,
     ) = struct.unpack(HEADER_FORMAT, header_data)
 
     # Bilddaten extrahieren
     left_data = message[HEADER_SIZE:HEADER_SIZE + left_size]
+    right_data = message[HEADER_SIZE + left_size : HEADER_SIZE + left_size + right_size]
 
-    # Bild-Typ bestimmen (CV_8UC3)
-    if left_type == cv2.CV_8UC3:
-        dtype = np.uint8
-        img = np.frombuffer(left_data, dtype=dtype).reshape((left_height, left_width, 3))
-    else:
-        print(f"Unbekannter left_type: {left_type}")
-        continue
-    # Debug-Anzeige
-#    cv2.imshow("Left Frame", img)
+    # Mapping OpenCV-Typ → (NumPy-Datentyp, Shape-Dimensionen)
+    opencv_type_map = {
+        cv2.CV_8UC1: (np.uint8, 1),
+        cv2.CV_8UC3: (np.uint8, 3),
+        cv2.CV_16UC1: (np.uint16, 1),
+        cv2.CV_32FC1: (np.float32, 1),
+    }
 
-#    if depth_size > 0:
-#        # Bilddaten extrahieren
-#        depth_data = message[HEADER_SIZE + left_size:]
-#        depth_img = np.frombuffer(depth_data, dtype=np.uint16).reshape((depth_height, depth_width))
-#
-#        # Depth normalisieren zum Anzeigen und Debug-Anzeige
-#        depth_vis = cv2.normalize(depth_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-#        depth_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-#        cv2.imshow("Depth Frame", depth_colored)
+    if left_type in opencv_type_map and right_type in opencv_type_map:
+        left_dtype, left_channels = opencv_type_map[left_type]
+        right_dtype, right_channels = opencv_type_map[right_type]
 
-    # Frame-Size Debug
+        try:
+            if left_channels == 1:
+                left_img = np.frombuffer(left_data, dtype=left_dtype).reshape((left_height, left_width))
+            else:
+                left_img = np.frombuffer(left_data, dtype=left_dtype).reshape((left_height, left_width, left_channels))
+
+            if right_channels == 1:
+                right_img = np.frombuffer(right_data, dtype=right_dtype).reshape((right_height, right_width))
+            else:
+                right_img = np.frombuffer(right_data, dtype=right_dtype).reshape((right_height, right_width, right_channels))
+
+        except ValueError as e:
+            print(f"Fehler beim Umformen der Bilder: {e}")
+            continue
+
+    # --- Inferenz mit YOLOv8 TensorRT ---
+    detections = model.infer(left_img)
+
+    # Bounding Boxes zeichnen
+    left_img = draw_detections(left_img, detections, CLASS_NAMES)
+
+    # ✅ Debug-Anzeige (Left)
+    cv2.imshow("Left Frame", left_img)
+#    cv2.imshow("Right Frame", right_img)
+
+    # ✅ Frame-Size Debug
 #    if size_printed == 0:
-#        print(f"Left Frame Size: {left_width} x {left_height}")
+#        print(f"Left Frame: {left_width}x{left_height} | Right Frame: {right_width}x{right_height}")
+#        print(f"[DEBUG] Empfangener left_type: {left_type}, expected: {cv2.CV_8UC3}")
+#        print(f"[DEBUG] Empfangener right_type: {right_type}, expected: {cv2.CV_8UC3}")
 #        size_printed = 1
 
     # --- FPS-Zähler ---
@@ -92,6 +134,7 @@ while True:
 
         if seconds_elapsed >= 5 and fps_outputs < 15:
             print(f"Sekunde {seconds_elapsed - 4}: FPS = {frame_count}")
+            fps_list.append(frame_count)
             fps_outputs += 1
         frame_count = 0
 
@@ -99,7 +142,6 @@ while True:
         if fps_outputs == 15:
             avg_fps = sum(fps_list) / len(fps_list)
             print(f"\n✅ Durchschnittliche FPS über 15 Sekunden: {avg_fps:.2f}")
-            break
 
     # ESC zum Abbrechen
     if cv2.waitKey(1) & 0xFF == 27:

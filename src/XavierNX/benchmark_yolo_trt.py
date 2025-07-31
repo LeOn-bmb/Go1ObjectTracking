@@ -54,6 +54,8 @@ seconds_elapsed = 0
 # Array-Speicher für FPS-Werte
 fps_list = []
 
+size_printed = 0  #Frame-Size Debug einmalig
+
 # --- ZeroMQ-Setup ---
 HEADER_FORMAT = "IIIIIIII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -64,13 +66,13 @@ socket.bind("tcp://*:5555")
 print("🚀 Empfänger bereit...")
 
 def get_latest_message(sock):
-    msg = None
+    message = None
     while True:
         try:
-            msg = sock.recv(flags=zmq.NOBLOCK)
+            message = sock.recv(flags=zmq.NOBLOCK)
         except zmq.Again:
             break
-    return msg
+    return message
 
 while True:
     message = get_latest_message(socket)
@@ -78,29 +80,65 @@ while True:
         time.sleep(0.001)
         continue
 
-    header = message[:HEADER_SIZE]
+    # Header extrahieren
+    header_data = message[:HEADER_SIZE]
     (
-        left_size, left_width, left_height, left_type,
-        depth_size, depth_width, depth_height, depth_type
-    ) = struct.unpack(HEADER_FORMAT, header)
+            left_size,
+            left_width,
+            left_height,
+            left_type,
+            right_size,
+            right_width,
+            right_height,
+            right_type,
+    ) = struct.unpack(HEADER_FORMAT, header_data)
 
+    # Bilddaten extrahieren
     left_data = message[HEADER_SIZE:HEADER_SIZE + left_size]
-    if left_type == cv2.CV_8UC3:
-        frame = np.frombuffer(left_data, dtype=np.uint8).reshape((left_height, left_width, 3))
+    right_data = message[HEADER_SIZE + left_size : HEADER_SIZE + left_size + right_size]
+
+    # Mapping OpenCV-Typ → (NumPy-Datentyp, Shape-Dimensionen)
+    opencv_type_map = {
+        cv2.CV_8UC1: (np.uint8, 1),
+        cv2.CV_8UC3: (np.uint8, 3),
+        cv2.CV_16UC1: (np.uint16, 1),
+        cv2.CV_32FC1: (np.float32, 1),
+    }
+
+    if left_type in opencv_type_map and right_type in opencv_type_map:
+        left_dtype, left_channels = opencv_type_map[left_type]
+        right_dtype, right_channels = opencv_type_map[right_type]
+
+        try:
+            if left_channels == 1:
+                left_img = np.frombuffer(left_data, dtype=left_dtype).reshape((left_height, left_width))
+            else:
+                left_img = np.frombuffer(left_data, dtype=left_dtype).reshape((left_height, left_width, left_channels))
+
+            if right_channels == 1:
+                right_img = np.frombuffer(right_data, dtype=right_dtype).reshape((right_height, right_width))
+            else:
+                right_img = np.frombuffer(right_data, dtype=right_dtype).reshape((right_height, right_width, right_channels))
+
+        except ValueError as e:
+            print(f"❌ Fehler beim Umformen der Bilder: {e}")
+            continue
     else:
-        print(f"❌ Unbekannter left_type: {left_type}")
+        print(f"❌ Unbekannter OpenCV-Typ – Left: {left_type}, Right: {right_type}")
         continue
 
     # --- Inferenz starten ---
-    host_input[:] = preprocess(frame)
+    host_input[:] = preprocess(left_img)
     cuda.memcpy_htod(d_input, host_input)
     context.execute_v2(bindings)
     cuda.memcpy_dtoh(host_output, d_output)
 
 
-    # Frame-Size Debug
+    # ✅ Frame-Size Debug
 #    if size_printed == 0:
-#        print(f"Left Frame Size: {left_width} x {left_height}")
+#        print(f"Left Frame: {left_width}x{left_height} | Right Frame: {right_width}x{right_height}")
+#        print(f"[DEBUG] Empfangener left_type: {left_type}, expected: {cv2.CV_8UC3} ({cv2.CV_8UC3})")
+#        print(f"[DEBUG] Empfangener right_type: {right_type}, expected: {cv2.CV_8UC3}")
 #        size_printed = 1
 
     # --- Debugging Anzeige ---

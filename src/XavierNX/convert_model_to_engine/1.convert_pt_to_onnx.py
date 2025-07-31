@@ -1,3 +1,5 @@
+# Shell-cmd: yolo export model=best.pt format=onnx device=0 dynamic=False simplify=True imgsz=416,480 opset=12
+
 import os
 from ultralytics import YOLO
 

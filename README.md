@@ -20,7 +20,7 @@ Das System wurde für ressourcenbeschränkte Edge-Hardware wie den Jetson Xavier
 🔧 2. Build-Time Dependencies (für Modellkonvertierung auf Host/XavierNX, Python 3.8)
 ---
 
-- [Python3.8](https://linuxize.com/post/how-to-install-python-3-8-on-ubuntu-18-04/) - erforderlich für ultralytics
+- [Python3.8 oder höher](https://linuxize.com/post/how-to-install-python-3-8-on-ubuntu-18-04/) - erforderlich für ultralytics
 - [Ultralytics](https://docs.ultralytics.com/de/quickstart/) - zum Laden und Exportieren von YOLO .pt-Modellen in .onnx
 - [PyTorch](https://docs.ultralytics.com/de/guides/nvidia-jetson/#install-pytorch-and-torchvision) – automatisch mit ultralytics installiert (nur kompatibel mit x86 / nicht direkt auf Jetson)
 - ONNX, ONNX-Simplifier – für ONNX-Export, falls simplify=True
@@ -70,5 +70,5 @@ cd Go1ObjectTracking;
 🏁 Hauptprogramm auf dem Xavier NX starten:
 ```
 cd Go1ObjectTracking/src/XavierNX; 
-python3.8 get_perception.py
+python3 get_perception.py
 ```

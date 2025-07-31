@@ -2,16 +2,16 @@ import os
 import subprocess
 
 # Modellverzeichnis
-model_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../models'))
-trtexec_path = '/usr/src/tensorrt/bin/trtexec'  # Pfad ggf. anpassen
+model_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../models'))   # Pfad ggf. anpassen
+trtexec_path = '/usr/src/tensorrt/bin/trtexec'  
 use_fp16 = True
 
 print(f"🚀 Starte Konvertierung von ONNX nach TensorRT-Engines im Verzeichnis: {model_dir}\n")
 
 for filename in os.listdir(model_dir):
-    if filename.endswith("_int32.onnx"):
+    if filename.endswith("_int32.onnx"):    # Datei(en), die mit "_int32.onnx" enden konvertieren
         onnx_path = os.path.join(model_dir, filename)
-        engine_path = onnx_path.replace("_int32.onnx", ".engine")
+        engine_path = onnx_path.replace("_int32.onnx", ".engine") 
 
         if os.path.exists(engine_path):
             print(f"⚠️  {engine_path} existiert bereits – überspringe.")
