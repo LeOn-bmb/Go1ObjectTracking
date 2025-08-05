@@ -35,29 +35,34 @@ class YOLOv8TensorRT:
         self.bindings = [int(self.d_input), int(self.d_output)]
 
     def preprocess(self, image):
-        # Originalbild-Größe
-        h0, w0 = image.shape[:2]
-        r = min(self.input_width / w0, self.input_height / h0)
-        new_unpad = int(round(w0 * r)), int(round(h0 * r))
+        # BGR → RGB (optional, wenn Training auf RGB)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # Resize mit intakter Aspect Ratio
+        h0, w0 = image.shape[:2]
+        r = min(self.input_height / h0, self.input_width / w0)
+        new_unpad = int(round(w0 * r)), int(round(h0 * r))  # (new_w, new_h)
+
+        # Resize mit Aspect Ratio
         resized = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
 
-        # Padding hinzufügen
+        # Padding berechnen
         dw = self.input_width - new_unpad[0]
         dh = self.input_height - new_unpad[1]
-        top, bottom = dh // 2, dh - (dh // 2)
-        left, right = dw // 2, dw - (dw // 2)
+
+        top = int(round(dh / 2 - 0.1))
+        bottom = int(round(dh / 2 + 0.1))
+        left = int(round(dw / 2 - 0.1))
+        right = int(round(dw / 2 + 0.1))
 
         padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
 
-        # Debug: merken für spätere Rücktransformation
         self.letterbox_info = (r, left, top)
 
         img = padded.astype(np.float32) / 255.0
         img = img.transpose(2, 0, 1)
         img = np.expand_dims(img, axis=0)
         return img.ravel()
+
 
     def infer(self, image):
         self.host_input[:] = self.preprocess(image)
@@ -88,10 +93,10 @@ class YOLOv8TensorRT:
         boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
 
         # Rücktransformation
-        r, left, top = self.letterbox_info
-        boxes_xyxy[:, [0, 2]] -= left
-        boxes_xyxy[:, [1, 3]] -= top
-        boxes_xyxy /= r
+        r, pad_x, pad_y = self.letterbox_info
+        boxes[:, [0, 2]] -= pad_x
+        boxes[:, [1, 3]] -= pad_y
+        boxes /= r
 
         # Skalierung auf Originalbildgröße
         h_orig, w_orig = original_shape[:2]
@@ -104,10 +109,19 @@ class YOLOv8TensorRT:
         boxes_xyxy[:, 2] = np.clip(boxes_xyxy[:, 2], 0, w_orig)
         boxes_xyxy[:, 3] = np.clip(boxes_xyxy[:, 3], 0, h_orig)
 
+        # Einbauen der NMS
+        if len(boxes_xyxy) > 0:
+            keep = self.nms(boxes_xyxy, confidences, self.iou_thresh)
+            boxes_xyxy = boxes_xyxy[keep]
+            confidences = confidences[keep]
+            class_ids = class_ids[keep]
+
+        # Ergebnisse zusammensetzen
         result = []
         for i in range(len(boxes_xyxy)):
             box = boxes_xyxy[i]
             result.append([box[0], box[1], box[2], box[3], confidences[i], class_ids[i]])
+
         return result
 
     def nms(self, boxes, scores, iou_threshold):

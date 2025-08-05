@@ -20,10 +20,9 @@ model = YOLOv8TensorRT(
     engine_path="./models/trained_yolov8n.engine",
     input_width=480,
     input_height=416,
-    conf_thresh=0.3,
+    conf_thresh=0.2,
     iou_thresh=0.4,
 )
-
 CLASS_NAMES = ["bottle", "can"]
 
 # Funktion um die Bounding Boxes zu zeichnen
