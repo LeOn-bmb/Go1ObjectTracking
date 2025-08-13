@@ -94,9 +94,9 @@ class YOLOv8TensorRT:
 
         # Rücktransformation
         r, pad_x, pad_y = self.letterbox_info
-        boxes[:, [0, 2]] -= pad_x
-        boxes[:, [1, 3]] -= pad_y
-        boxes /= r
+        boxes_xyxy[:, [0, 2]] -= pad_x
+        boxes_xyxy[:, [1, 3]] -= pad_y
+        boxes_xyxy /= r
 
         # Skalierung auf Originalbildgröße
         h_orig, w_orig = original_shape[:2]

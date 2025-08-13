@@ -28,13 +28,14 @@ print("Empfänger bereit...")
 
 # Parser-Argumente definieren
 parser = argparse.ArgumentParser(description="Empfängt Bilder, führt Objekterkennung durch und führt optional Debugfunktionen per Tastendruck durch.")
-parser.add_argument('--debug-img', metavar='imgname', help='Dateiname für das zu speichernde')
+parser.add_argument('--debug-img', metavar='imgname', 
+                    help='Dateiname für das zu speichernde Bild, dann wählbar l(eft), r(ight), d(isparity), c(ombined)')
 parser.add_argument('--debug-view', choices=['left', 'right', 'both'],
-                    help='Debug-Anzeige: linkes/rechtes Bild anzeigen')
-parser.add_argument('--debug-size', action='store_true',
-                    help='Frame-Größen und Typen debuggen')
+                    help='Debug-Anzeige: linkes/rechtes oder beide Bilder anzeigen')
 parser.add_argument('--debug-disp', action='store_true',
                     help='Disparitätskarte anzeigen')
+parser.add_argument('--debug-size', action='store_true',
+                    help='Frame-Größen und Typen debuggen')
 parser.add_argument('--debug-fps', action='store_true',
                     help='FPS-Messung ausgeben')
 args = parser.parse_args()
@@ -53,29 +54,62 @@ CLASS_NAMES = ["bottle", "can"]
 fx = 193.85525427753637            # Fokalweite in Pixeln
 baseline_mm = 24.799092979022241   # Basislinie in mm
 
+# --- Globale Konfigurationsparameter für StereoSGBM ---
+MIN_DISPARITY = 0
+NUM_DISPARITIES = 64  # Muss durch 16 teilbar sein
+WINDOW_SIZE = 7       # 5–15 empfohlen, ungerade
+NUM_CHANNELS = 1      # Graustufenbild
+P1 = 8 * NUM_CHANNELS * WINDOW_SIZE ** 2
+P2 = 32 * NUM_CHANNELS * WINDOW_SIZE ** 2
+
 # --- Hilfsfunktion: Tiefenschätzung aus Bounding Box ---
-def get_min_depth_from_bbox(bbox, disparity_map, fx, baseline_mm):
+def get_depth_from_bbox(bbox, disparity_map, fx, baseline_mm):
+    # --- Disparitätsbereich für 10–100 cm berechnen ---
+    z_min_mm = 100.0   # 10 cm
+    z_max_mm = 1000.0  # 100 cm
+    d_max = (fx * baseline_mm) / z_min_mm   # Disparität für 10 cm
+    d_min = (fx * baseline_mm) / z_max_mm   # Disparität für 100 cm
+    margin = 0.05  # 5 % Puffer
+    d_max *= (1 + margin)
+    d_min *= (1 - margin)
+#    print(f"Valid disparity range: {d_min:.2f} - {d_max:.2f} px")
+
     x1, y1, x2, y2 = map(int, bbox[:4])
     h, w = disparity_map.shape
-    x1 = max(0, x1)
-    y1 = max(0, y1)
-    x2 = min(w - 1, x2)
-    y2 = min(h - 1, y2)
-
-    disparity_roi = disparity_map[y1:y2, x1:x2]
-    valid_disparities = disparity_roi[disparity_roi > 0]
-    if valid_disparities.size == 0:
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(w-1, x2); y2 = min(h-1, y2)
+    if x2 <= x1 or y2 <= y1:
         return None
 
-    min_disp = np.min(valid_disparities)
-    depth = (fx * baseline_mm) / min_disp   # Tiefenformel
+    # Fokus auf mittleren Vertikalbereich
+    y_start_middle = int(y1 + (y2 - y1) * 0.35)
+    y_end_middle = int(y1 + (y2 - y1) * 0.70)
+    if y_end_middle <= y_start_middle:
+        return None
+
+    disparity_roi = disparity_map[y_start_middle:y_end_middle, x1:x2]
+    if disparity_roi.size == 0:
+        return None
+
+    # Disparitäten im erlaubten Bereich filtern
+    valid_disparities = disparity_roi[
+        (disparity_roi >= d_min) & (disparity_roi <= d_max)
+    ]
+    if valid_disparities.size == 0:
+        return None
+    
+    median_disp = np.percentile(valid_disparities, 28)
+    
+    # Debug: Disparität zu BB
+#    print(f"BBox: {bbox} | Median Disparity: {median_disp:.2f}")
+    depth = (fx * baseline_mm) / median_disp    # Tiefenformel
     return depth
 
 # --- Hilfsfunktion: Bounding Boxes zeichnen ---
 def draw_detections(left_img, detections, class_names, disparity_map):
     for det in detections:
         x1, y1, x2, y2, conf, cls_id = det
-        depth = get_min_depth_from_bbox([x1, y1, x2, y2], disparity_map, fx, baseline_mm)
+        depth = get_depth_from_bbox([x1, y1, x2, y2], disparity_map, fx, baseline_mm)
 
         label = f"{class_names[int(cls_id)]}: {conf:.2f}"
         if depth:
@@ -86,11 +120,11 @@ def draw_detections(left_img, detections, class_names, disparity_map):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     return left_img
 
-# --- Debugfunktion: Jpeg-Aufnahme ---
+# --- Debugfunktion: PNG-Aufnahme ---
 def capture_frame(img, filename):
-    # Sicherstellen, dass der Dateiname auf .jpg endet
-    if not filename.lower().endswith('.jpg'):
-        filename = os.path.splitext(filename)[0] + '.jpg'
+    # Sicherstellen, dass der Dateiname auf .png endet
+    if not filename.lower().endswith('.png'):
+        filename = os.path.splitext(filename)[0] + '.png'
 
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -118,10 +152,15 @@ def print_debug_frame_info(left_width, left_height, right_width, right_height, l
     print(f"Empfangener right_type: {right_type}, expected: {cv2.CV_8UC3}")
 
 # --- Debugfunktion: Disparität anzeigen ---
-def show_disparity_map(disparity, minDisparity=0, numDisparities=128):
-    disp_vis = (disparity - minDisparity) / numDisparities  # Normalisieren auf 0–1
-    disp_vis = np.uint8(np.clip(disp_vis * 255, 0, 255))
-    disp_vis = cv2.applyColorMap(disp_vis, cv2.COLORMAP_JET)
+def show_disparity_map(disparity):
+    valid_disparities = disparity[disparity > 0]
+    if valid_disparities.size == 0:
+        cv2.imshow("Disparity", np.zeros_like(disparity))
+        return
+
+    disp_vis = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX)
+    disp_vis = np.uint8(disp_vis)
+#    disp_vis = cv2.applyColorMap(disp_vis, cv2.COLORMAP_JET)
     cv2.imshow("Disparity", disp_vis)
 
 # --- Debugfunktion: FPS-Anzeige ---
@@ -212,20 +251,35 @@ while True:
     gray_left = cv2.cvtColor(left_img, cv2.COLOR_BGR2GRAY)
     gray_right = cv2.cvtColor(right_img, cv2.COLOR_BGR2GRAY)
 
+    # Vorverarbeitung
+    # Sanftes Rauschen entfernen
+    gray_left = cv2.bilateralFilter(gray_left, 7, 75, 75)
+    gray_right = cv2.bilateralFilter(gray_right, 7, 75, 75)
+    gray_left = cv2.GaussianBlur(gray_left, (5,5), 0)
+    gray_right = cv2.GaussianBlur(gray_right, (5,5), 0)
+
+    # Lokale Kontrastanpassung
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    gray_left = clahe.apply(gray_left)
+    gray_right = clahe.apply(gray_right)   
+
+    # --- StereoSGBM-Kofig ---
     stereo = cv2.StereoSGBM_create(
-        minDisparity=0,
-        numDisparities=128,
-        blockSize=9,
-        P1=8 * 3 * 9**2,
-        P2=32 * 3 * 9**2,
-        disp12MaxDiff=1,
-        uniquenessRatio=5,
-        speckleWindowSize=50,
-        speckleRange=1,
-        preFilterCap=63,
+        minDisparity = MIN_DISPARITY,
+        numDisparities = NUM_DISPARITIES,
+        blockSize = WINDOW_SIZE,
+        P1 = P1,
+        P2 = P2,
+        disp12MaxDiff = 1,
+        uniquenessRatio = 5,
+        speckleWindowSize = 100,
+        speckleRange = 16,
+        preFilterCap = 31,
         mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
     )
     disparity = stereo.compute(gray_left, gray_right).astype(np.float32) / 16.0
+    # Alle negativen Werte (ungültige Bereiche) auf 0 setzen
+    disparity[disparity < 0] = 0
 
     # --- Inferenz mit YOLOv8 TensorRT ---
     detections = model.infer(left_img)
@@ -259,6 +313,7 @@ while True:
     # ESC zum Abbrechen
     if key == 27:
         break
+
     # 'l', 'r' oder 'd' im debug-img Mode zum Bild aufnehmen
     elif key == ord('l') and args.debug_img:
         capture_frame(left_img, args.debug_img)
@@ -267,8 +322,15 @@ while True:
     elif key == ord('d') and args.debug_img:
         disp_vis = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX)
         disp_vis = np.uint8(disp_vis)
+#        disp_colored = cv2.applyColorMap(disp_vis, cv2.COLORMAP_JET)
+        capture_frame(disp_vis, args.debug_img)
+    elif key == ord('c') and args.debug_img:
+        disp_vis = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX)
+        disp_vis = np.uint8(disp_vis)
+        # Konvertieren die Graustufen-Disparitätskarte in ein Farbbild
         disp_colored = cv2.applyColorMap(disp_vis, cv2.COLORMAP_JET)
-        capture_frame(disp_colored, args.debug_img)
+        combined = np.hstack([left_img, disp_colored])
+        capture_frame(combined, args.debug_img)
 
 # --- Aufräumen ---
 socket.close()

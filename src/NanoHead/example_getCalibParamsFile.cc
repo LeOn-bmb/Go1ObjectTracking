@@ -13,7 +13,7 @@
 
 int main(int argc, char *argv[]){
     
-    UnitreeCamera cam("trans_rect_config.yaml"); ///< init UnitreeCamera object by config file
+    UnitreeCamera cam("stereo_camera_config.yaml"); ///< init UnitreeCamera object by config file
     if(!cam.isOpened())     ///< get camera open state
         exit(EXIT_FAILURE);
     
