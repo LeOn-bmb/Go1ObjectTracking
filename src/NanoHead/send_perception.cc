@@ -59,9 +59,10 @@ int main(int argc, char *argv[]) {
         int seconds_elapsed = 0;
         int fps_outputs = 0; // Anzahl der ausgegebenen FPS-Werte
 
-    // ZeroMQ: Client Init 
+    // ZeroMQ: PUSH to Xavier NX 
         zmq::context_t context(1);
         zmq::socket_t publisher(context, ZMQ_PUSH);
+        publisher.set(zmq::sockopt::sndhwm, 4);
         publisher.connect("tcp://192.168.123.15:5555");
 
     while (cam.isOpened()) {

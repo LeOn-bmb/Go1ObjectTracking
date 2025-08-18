@@ -70,5 +70,5 @@ cd Go1ObjectTracking;
 🏁 Hauptprogramm auf dem Xavier NX starten:
 ```
 cd Go1ObjectTracking/src/XavierNX; 
-python3 get_perception.py
+python3 main.py
 ```
