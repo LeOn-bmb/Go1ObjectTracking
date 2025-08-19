@@ -2,6 +2,7 @@
   * @file perception.cc
   * @brief Ergänzte Version von example_getRectFrame.cc zum Senden via ZeroMQ
   * @details Dieses Beispiel optimiert die Perfomance und sendet die Frames via ZeroMQ an den Jetson Xavier NX.
+  * @author LeOn-bmb
   * 
   * Basierend auf:
   *   example_getRectFrame.cc

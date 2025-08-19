@@ -98,25 +98,20 @@ if not fs.isOpened():
     raise SystemExit("[FATAL] Konnte camCalibParams.yaml nicht öffnen. Pfad prüfen.")
 
 # linke Intrinsic-Matrix und Translationsvektor auslesen
-left_intrinsic_node = fs.getNode("LeftIntrinsicMatrix")
-translation_node = fs.getNode("Translation")
+left_kfe = fs.getNode("LeftKFE").mat()
+right_kfe = fs.getNode("RightKFE").mat()
+translation = fs.getNode("LeftTranslation").mat()
 
-if left_intrinsic_node.empty() or translation_node.empty():
-    fs.release()
-    raise SystemExit("[FATAL] Fehlende Knoten in camCalibParams.yaml: 'LeftIntrinsicMatrix' oder 'Translation'.")
-
-left_intrinsic = left_intrinsic_node.mat()
-translation = translation_node.mat()
 fs.release()
 
 # Einzelwerte extrahieren
-fx = float(left_intrinsic[0, 0])      # Fokalweite in Pixeln
-cx = float(left_intrinsic[0, 2])
+fx = float(left_kfe[0, 0])      # Fokalweite in Pixeln
+cx = float(left_kfe[0, 2])
 if args.debug_size:
     print("Left camera intrinsics:")
     print(f"fx = {fx}, cx = {cx}")
 
-baseline_mm = abs(translation[0, 0])    # Basislinie in mm
+baseline_mm = float(abs(translation[0, 0]))    # Basislinie in mm
 if args.debug_size:
     print(f"Baseline: {baseline_mm:.3f} mm")
 
