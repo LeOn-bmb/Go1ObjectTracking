@@ -11,7 +11,6 @@ import json
 import time
 import sys
 import argparse
-from datetime import datetime
 
 # Pfad zum Roboter-Interface
 sys.path.append('./lib/python/arm64')   # ggf. anpassen
@@ -27,6 +26,8 @@ socket = context.socket(zmq.PULL)
 socket.setsockopt(zmq.RCVHWM, 4)
 socket.setsockopt(zmq.LINGER, 0)
 socket.bind("tcp://*:5560")  # auf Verbindung warten
+
+print("Empfänger bereit...")
 
 # --- Parser-Argumente ---
 parser = argparse.ArgumentParser(description="Empfängt JSON vom Xavier (PUSH -> PULL) und steuert Unitree per UDP.")
@@ -45,9 +46,6 @@ cmd.velocity[0] = 0.0
 cmd.velocity[1] = 0.0
 cmd.yawSpeed = 0.0
 
-last_recv_ts = None
-count = 0
-
 # ---------- PID-Zustand ----------
 Kp = 1.0
 Ki = 0.3
@@ -56,7 +54,6 @@ Kd = 0.02
 MAX_YAW = 1.0               # Max yawSpeed (rad/s)
 DEADBAND_ANGLE = 0.03       # rad (~1.7°)
 DEADBAND_UNORM = 0.03       # 3 % halbe Bildbreite
-STALE_TIMEOUT = 0.6         # Sekunden bis "Stale"
 
 integrator = 0.0
 prev_error = 0.0
@@ -64,12 +61,9 @@ prev_time = time.time()
 integrator_limit = MAX_YAW * 2.0  # Anti-Windup
 deriv_filtered = 0.0
 deriv_tau = 0.02
-last_detection_time = None
-
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
-
 
 def compute_pid(signal, dt, source):
     """
@@ -111,7 +105,7 @@ def compute_pid(signal, dt, source):
 def extract_angle_or_unorm(data):
     """
     Priorisiere angle_rad für PID. Fallback auf u_norm.
-    Liefert (value, source) zurück.
+    Liefert value & source aus data.
     """
     det = data.get("detection") or data.get("detections")
     if det is None:
@@ -131,30 +125,12 @@ def extract_angle_or_unorm(data):
 
     return None, None
 
-
-print("[INFO] Main-Loop gestartet. Ctrl+C beendet.")
-
 try:
     while True:
         # Nachricht erhalten
         try:
             msg = socket.recv(flags=zmq.NOBLOCK)
-            recv_time = time.time()
-            count += 1
         except zmq.Again:
-            # keine neue Nachricht
-            time.sleep(0.002)
-            # Stale-check
-            if last_detection_time is not None and (time.time() - last_detection_time) > STALE_TIMEOUT:
-                print("[INFO] Stale-Timeout erreicht — stoppe Drehung und lösche Integrator")
-                integrator = prev_error = deriv_filtered = 0.0
-                cmd.yawSpeed = 0.0
-                try:
-                    udp.SetSend(cmd)
-                    udp.Send()
-                except:
-                    pass
-                last_detection_time = None
             continue
 
         # JSON decodieren
@@ -165,10 +141,6 @@ try:
             continue
 
         # Ausgabe
-        ts_str = datetime.fromtimestamp(recv_time).isoformat(timespec='milliseconds')
-        delta = (recv_time - last_recv_ts) if last_recv_ts else None
-        print(f"\n[{ts_str}] seq={count}  delta={('%.3fs' % delta) if delta else '---'}")
-
         det = data.get("detection") or data.get("detections")
         if det is not None:
             dets = [det] if isinstance(det, dict) else det
@@ -181,8 +153,6 @@ try:
         if args.verbose:
             print("Full JSON:")
             print(json.dumps(data, indent=2))
-
-        last_recv_ts = recv_time
 
         # PID auf Winkel
         angle, source = extract_angle_or_unorm(data)

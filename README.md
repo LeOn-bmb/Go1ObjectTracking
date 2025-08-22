@@ -32,13 +32,14 @@ Das System wurde für ressourcenbeschränkte Edge-Hardware wie den Jetson Xavier
 - OpenCV (Version 4 oder höher) - für Bildverarbeitung
 - CMake (Version 3.11 oder höher) - zum bauen von C-Anwendungen
 - Python3 (Version 3.6 oder höher)
-- [ZeroMQ](https://zeromq.org/get-started/) - leichtgewichtige Messaging-Library (für Bildstreaming vom Jetson Nano zum Xavier NX)
+- [ZeroMQ](https://zeromq.org/get-started/) - leichtgewichtige Messaging-Library (für Bildstreaming vom Jetson Nano zum Xavier NX und zum Raspberry PI)
   
 Nur auf Xavier NX erforderlich für Objekterkennung
 ---
 
 - [TensorRT](https://developer.nvidia.com/tensorrt) - NVIDIA-Inferenz-Bibliothek, die speziell für NVIDIA GPUs die maximale Inferenz-Performance aus ONNX-Modellen herausholt (z. B. Version 7.1.3.0 unter JetPack 4.5)
 - [PyCUDA](https://wiki.tiker.net/PyCuda/Installation/Linux/) – nützlich für Memory Binding, CUDA Streams mit TensorRT & Speicherverwaltung in GPU
+- [SORT](https://github.com/abewley/sort.git) -Für das Tracking der Objekte (nützlich bei sich bewegenden Objekten)
 
 📁 3. Build 
 ---
