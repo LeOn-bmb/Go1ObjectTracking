@@ -52,7 +52,7 @@ Ki = 0.3
 Kd = 0.02
 
 MAX_YAW = 1.0               # Max yawSpeed (rad/s)
-DEADBAND_ANGLE = 0.03       # rad (~1.7°)
+DEADBAND_ANGLE = 0.035      # rad (~2°)
 DEADBAND_UNORM = 0.03       # 3 % halbe Bildbreite
 
 integrator = 0.0
@@ -149,10 +149,10 @@ try:
                 conf = d.get("conf")
                 angle_rad = d.get("angle_rad")
                 u_norm = d.get("u_norm")
-                print(f"  Det[{i}]: class={cname} conf={conf} angle_rad={angle_rad} u_norm={u_norm}")
-        if args.verbose:
-            print("Full JSON:")
-            print(json.dumps(data, indent=2))
+                if args.verbose:
+                    print(f"[INFO] Det {i}: class={cname} conf={conf:.2f} angle_rad={angle_rad:.3f} u_norm={u_norm:.3f}")
+        else:
+            print("[INFO] Keine Detektionen im Payload.")
 
         # PID auf Winkel
         angle, source = extract_angle_or_unorm(data)
