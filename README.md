@@ -10,38 +10,38 @@ Ziel dieses Projekts ist es, den Go1-Roboter von Unitree mit einem Echtzeit-Obje
 
 Dieses Verzeichnis stellt den vollständigen Software-Stack zur Verfügung, um den Go1-Roboter für folgende Aufgaben vorzubereiten:
 
-- Objekterkennung mittels YOLO11n-Engine-Model (Inference optimiert mit TensorRT für maximale Performance auf Jetson-Plattformen)
-- Tiefenmessung via Depth-Frames aus der Unitree Kamera (ermöglicht präzise Distanzberechnungen zu erkannten Objekten)
-- Zielverfolgung durch Navigation bis zum Objekt mit aktivem Abstandsregler
-- Modulare Architektur mit ZeroMQ für die Bildübertragung zwischen Kamera-Head (Jetson Nano) und Verarbeitungseinheit (Xavier NX)
+- **Objekterkennung** mittels YOLO11n-Engine-Model (Inference optimiert mit TensorRT für maximale Performance auf Jetson-Plattformen)
+- **Tiefenmessung** via Disparitätsberechnung mittels kalibrierten Stereokameras (ermöglicht präzise Distanzberechnungen zu erkannten Objekten)
+- **Zielverfolgung** durch Navigation bis zum Objekt mit aktivem Abstandsregler
+- **Modulare Architektur** mit ZeroMQ für die Bildübertragung zwischen Kamera-Head (Jetson Nano) und Verarbeitungseinheit (Xavier NX)
 
-Das System wurde für ressourcenbeschränkte Edge-Hardware wie den Jetson Xavier NX optimiert und unterstützt optimierte Objekterkennungs-Modelle über TensorRT. Shape (width, height) nah an RectFrame-Size der Go1 Kamera angepasst und YOLO-Kompatibel (teilbar durch 32).
+Das System wurde für ressourcenbeschränkte Edge-Hardware wie den Jetson Xavier NX optimiert und unterstützt optimierte Objekterkennungs-Modelle über TensorRT. Die Input-Shape (width, height) nahe an RectFrame-Size der Go1 Kamera angepasst und YOLO-Kompatibel (teilbar durch 32).
 
 🔧 2. Build-Time Dependencies (für Modellkonvertierung auf Host/XavierNX, Python 3.8)
 ---
 
-- [Python3.8 oder höher](https://linuxize.com/post/how-to-install-python-3-8-on-ubuntu-18-04/) - erforderlich für ultralytics
+- [Python3.8+](https://linuxize.com/post/how-to-install-python-3-8-on-ubuntu-18-04/) - erforderlich für ultralytics
 - [Ultralytics](https://docs.ultralytics.com/de/quickstart/) - zum Laden und Exportieren von YOLO .pt-Modellen in .onnx
-- [PyTorch](https://docs.ultralytics.com/de/guides/nvidia-jetson/#install-pytorch-and-torchvision) – automatisch mit ultralytics installiert (nur kompatibel mit x86 / nicht direkt auf Jetson)
+- [PyTorch](https://docs.ultralytics.com/de/guides/nvidia-jetson/#install-pytorch-and-torchvision) – automatisch mit ultralytics installiert (nur x86-kompatibel, nicht direkt auf Jetson)
 - ONNX, ONNX-Simplifier – für ONNX-Export, falls simplify=True
-- trtexec - CLI-Tool aus dem NVIDIA TensorRT Toolkit (wandelt .onnx → .engine um; befindet sich i. d. R. unter /usr/src/tensorrt/bin/trtexec)
+- trtexec - CLI-Tool aus dem NVIDIA TensorRT Toolkit (.onnx → .engine, i. d. R. unter /usr/src/tensorrt/bin/trtexec)
 
-🚀 2.1 Runtime Dependencies (auf Jetson Go1, Python 3.6)
+🚀 3. Runtime Dependencies
 ---
 
-- OpenCV (Version 4 oder höher) - für Bildverarbeitung
-- CMake (Version 3.11 oder höher) - zum bauen von C-Anwendungen
-- Python3 (Version 3.6 oder höher)
-- [ZeroMQ](https://zeromq.org/get-started/) - leichtgewichtige Messaging-Library (für Bildstreaming vom Jetson Nano zum Xavier NX und zum Raspberry PI)
+(auf Jetson Go1, Python ≥3.6)
+- OpenCV (≥4) - für Bildverarbeitung
+- CMake (≥3.11) - zum bauen von C-Anwendungen
+- Python3.6+
+- [ZeroMQ](https://zeromq.org/get-started/) - leichtgewichtige Messaging-Library (Bildstreaming Nano → Xavier NX → Raspberry Pi)
   
-Nur auf Xavier NX erforderlich für Objekterkennung
----
+**Nur auf Xavier NX erforderlich (für Objekterkennung):**
+
 
 - [TensorRT](https://developer.nvidia.com/tensorrt) - NVIDIA-Inferenz-Bibliothek, die speziell für NVIDIA GPUs die maximale Inferenz-Performance aus ONNX-Modellen herausholt (z. B. Version 7.1.3.0 unter JetPack 4.5)
-- [PyCUDA](https://wiki.tiker.net/PyCuda/Installation/Linux/) – nützlich für Memory Binding, CUDA Streams mit TensorRT & Speicherverwaltung in GPU
-- [SORT](https://github.com/abewley/sort.git) -Für das Tracking der Objekte (nützlich bei sich bewegenden Objekten)
+- [PyCUDA](https://wiki.tiker.net/PyCuda/Installation/Linux/) – für Memory Binding, CUDA Streams mit TensorRT & Speicherverwaltung in GPU
 
-📁 3. Build 
+📁 4. Build 
 ---
 
 🔨 Bauen der C++-Anwendung auf dem Jetson Nano
@@ -52,17 +52,17 @@ cmake ..;
 make
 ```
 
-🚀 4. Run 
+🏃 5. Run
 ---
 
-🎥 Stereo-Kameras auf dem nano head auf blockierende Prozesse überprüfen:
+🎥 Kamera-Prozesse prüfen (Jetson Nano)
 ```
 v4l2-ctl --list-devices;
 lsof /dev/video1;
 kill -9 <PID>   # falls erforderlich
 ```
 
-📤 Senden der Frames an den Jetson Xavier NX:
+📤 Frames an Xavier NX senden
 ```
 cd Go1ObjectTracking; 
 ./bin/send_perception
@@ -73,3 +73,17 @@ cd Go1ObjectTracking;
 cd Go1ObjectTracking/src/XavierNX; 
 python3 main.py
 ```
+
+📡 Bewegungssteuerung auf Raspberry Pi
+```
+cd Go1ObjectTracking/src/Raspberry; 
+python3 motion.py
+```
+🔗 6. Architekturüberblick
+---
+
+<p align="center">
+  <img src="include/MethodenDiagramm.jpg" alt="Architekturdiagramm" width="900"/>
+  <br/>
+  <em>Abbildung 1: Architekturdiagramm des Go1-Stacks</em>
+</p>

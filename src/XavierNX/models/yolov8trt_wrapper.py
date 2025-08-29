@@ -35,7 +35,7 @@ class YOLOv8TensorRT:
         self.bindings = [int(self.d_input), int(self.d_output)]
 
     def preprocess(self, image):
-        # BGR → RGB (optional, wenn Training auf RGB)
+        # BGR → RGB (Training auf RGB)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         h0, w0 = image.shape[:2]
@@ -55,8 +55,6 @@ class YOLOv8TensorRT:
         right = int(round(dw / 2 + 0.1))
 
         padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-
-        self.letterbox_info = (r, left, top)
 
         img = padded.astype(np.float32) / 255.0
         img = img.transpose(2, 0, 1)
@@ -79,7 +77,7 @@ class YOLOv8TensorRT:
         confidences = output[:, 4]
         class_ids = output[:, 5].astype(int)
 
-        # Optional: Score-Filter
+        # Score-Filter
         mask = confidences > self.conf_thresh
         boxes = boxes[mask]
         confidences = confidences[mask]
@@ -91,12 +89,6 @@ class YOLOv8TensorRT:
         boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
         boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
         boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
-
-        # Rücktransformation
-        r, pad_x, pad_y = self.letterbox_info
-        boxes_xyxy[:, [0, 2]] -= pad_x
-        boxes_xyxy[:, [1, 3]] -= pad_y
-        boxes_xyxy /= r
 
         # Skalierung auf Originalbildgröße
         h_orig, w_orig = original_shape[:2]

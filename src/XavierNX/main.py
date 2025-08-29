@@ -9,6 +9,7 @@ Hauptskript:
 """
 
 from models.yolov8trt_wrapper import YOLOv8TensorRT
+from collections import deque
 import zmq
 import cv2
 import math
@@ -61,10 +62,8 @@ RESET_Z_THRESHOLD_MM = 250.0    # wenn neuer z mehr ist, dann Reset
 
 # --- CLI Parser-Argumente definieren ---
 parser = argparse.ArgumentParser(description="Empfängt Bilder, führt Objekterkennung durch und führt optional Debugfunktionen aus.")
-parser.add_argument('--debug-yolo', choices=['left','right','both'],
-                    help='YOLO-Detections zeichnen (left/right/both)')
-parser.add_argument('--debug-sort', action='store_true',
-                    help='SORT-Tracks im linken Bild zeichnen')
+parser.add_argument('--debug-view', choices=['left','right','both'],
+                    help='YOLO-Ergebnisse, Track-Ids und Distanz im linken, rechten oder beiden Bildern anzeigen')
 parser.add_argument('--debug-payload', choices=['left','right','both'],
                     help='Den gesendeten Track (Payload) im linken Bild markieren')
 parser.add_argument('--debug-size', action='store_true',
@@ -80,18 +79,10 @@ model = YOLOv8TensorRT(
     engine_path="./models/trained_yolov8n.engine",
     input_width=480,
     input_height=416,
-    conf_thresh=0.45,
-    iou_thresh=0.6,
+    conf_thresh=0.4,
+    iou_thresh=0.5,
 )
 CLASS_NAMES = ["bottle", "can"]
-
-# --- Tracking-Variablen ---
-track_states = {}  # Track-Status (id -> state dict)
-next_track_id = 0  # Nächste verfügbare Track-ID
-
-
-
-STALE_TIMEOUT = 7.0  # Sekunden ohne echte YOLO-Detection → nichts senden
 
 # --- Kamera-Parameter (aus Kalibrierungsdatei) laden ---
 fs = cv2.FileStorage("camCalibParams.yaml", cv2.FILE_STORAGE_READ)
@@ -108,11 +99,19 @@ fx = float(left_kfe[0, 0])                    # Fokalweite in Pixeln
 cx = float(left_kfe[0, 2])
 baseline_mm = float(abs(translation[0, 0]))   # Basislinie in mm
 
-# Update-Intervall der Tiefenmessung
-#DISPARITY_UPDATE_RATE = 6
-frame_idx = -1      # Frame-Index (für Disparität + Inferenz scheduling)
+# --- Tracking-Variablen ---
+track_states = {}  # Track-Status (id -> state dict)
+next_track_id = 0  # Nächste verfügbare Track-ID
 
-# ----------------- Hilfsfunktionen -----------------
+# Farbpalette für die Track-ID Disparitäten (RGB tuples)
+track_palette = [(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255),
+                         (128,0,0), (0,128,0), (0,0,128), (128,128,0), (128,0,128), (0,128,128),
+                         (64,64,64), (192,192,192), (255,165,0), (75,0,130), (255,20,147)]
+
+# --- Timeout für das Senden an den Raspberry Pi ---
+STALE_TIMEOUT = 7.0  # Sekunden ohne echte YOLO-Detection → nichts senden
+
+# ----------------- Receive-Phase -----------------
 
 # --- Nur den neuesten Frame verarbeiten ---
 def get_latest_message(sock, poller, timeout_ms=5):
@@ -129,6 +128,8 @@ def get_latest_message(sock, poller, timeout_ms=5):
             break
     return last_msg
 
+# ----------------- Detection-Phase -----------------
+
 # --- Bounding Boxes aufbauen  ---
 def build_processed_detections(raw_dets, class_names):
     processed = []
@@ -139,8 +140,6 @@ def build_processed_detections(raw_dets, class_names):
         u = (x1 + x2) / 2.0
         v = (y1 + y2) / 2.0
 
-#        z_mm = depth_from_bbox_pair(bbox_left, bbox_right, fx, baseline_mm)
-
         processed.append({
             'x1': int(x1), 'y1': int(y1),'x2': int(x2), 'y2': int(y2),
             'bbox': [int(x1), int(y1), int(x2), int(y2)],
@@ -148,17 +147,13 @@ def build_processed_detections(raw_dets, class_names):
             'class_id': int(cls_id),
             'class_name': class_names[int(cls_id)] if 0 <= int(cls_id) < len(class_names) else f"class_{int(cls_id)}",
             'u_px': float(u),
-            'v_px': float(v),
-            'z_mm': None,   # Platzhalter für später
-            'uR': None,     # Platzhalter für später
-            'vR': None,     # Platzhalter für später
-            'right_bbox': None  # Platzhalter für später
+            'v_px': float(v)
         })
     return processed
 
-# --- Bounding Boxes paaren (links/rechts) ---
+# --- Bounding Boxes paaren (Stereo-Matching links/rechts) ---
 def match_bboxes(processed_left, processed_right, fx, baseline_mm,
-                 max_v_diff=4, height_ratio_thresh=(0.7, 1.3), z_range_mm=(100, 900)):
+                 max_v_diff=3.5, height_ratio_thresh=(0.75, 1.35), z_range_mm=(100, 900)):
     matches = []
     used = set()
 
@@ -166,7 +161,7 @@ def match_bboxes(processed_left, processed_right, fx, baseline_mm,
     if fx is not None and baseline_mm is not None:
         d_max = (fx * baseline_mm) / z_range_mm[0]  # nahes Objekt
         d_min = (fx * baseline_mm) / z_range_mm[1]  # fernes Objekt
-        margin = 0.1
+        margin = 0.1  # 10 % Puffer
         d_max *= (1 + margin)
         d_min *= (1 - margin)
     else:
@@ -190,6 +185,7 @@ def match_bboxes(processed_left, processed_right, fx, baseline_mm,
             hR = det_right['y2'] - det_right['y1']
             v_diff = abs(vL - vR)
             h_ratio = hL / max(hR, 1e-6)
+#            print(f"[DEBUG] Checking match y-Abweichung = {v_diff:.2f} px | Ratio: {h_ratio:.2f}")
 
             # Filter: maximale v-Abweichung und Höhenverhältnis
             if v_diff > max_v_diff:
@@ -198,78 +194,64 @@ def match_bboxes(processed_left, processed_right, fx, baseline_mm,
                 continue
             # Disparität und Tiefenbereich prüfen
             uL, uR = det_left['u_px'], det_right['u_px']
-            disp = uL - uR
-            print(f"[DEBUG] Checking match L({uL:.1f},{vL:.1f}) R({uR:.1f},{vR:.1f}) disp={disp:.1f} d_min={d_min:.1f} d_max={d_max:.1f}")
+            disp = abs(uL - uR)
             if d_min is not None and (disp < d_min or disp > d_max):
                 continue
             
             # Beste Übereinstimmung anhand der Disparität zum erwarteten Wert
-            score = abs(det_left['u_px'] - det_right['u_px']) \
-                + 0.5 * v_diff \
-                + 0.5 * abs(1 - h_ratio) * hL
-
-
+            score = disp + 0.5 * v_diff + 0.5 * abs(1 - h_ratio) * hL
             if score < best_score:
                 best_score = score
-                best = (det_left, det_right)
+                best = (det_left, det_right, disp)
                 best_j = j
+
         if best is not None:
             used.add(best_j)
+            # rechte Box im linken Detection speichern
+            det_left['right_bbox'] = best[1]['bbox']
             matches.append(best)
     return matches
 
-# --- Track-States aktualisieren ---
-def update_tracks(matches, track_states, next_track_id, max_u_diff=20, max_v_diff=10):
-    """
-    Aktualisiert die Track-States basierend auf den Stereo-Matches.
-    - matches: Liste von (det_left, det_right)
-    - track_states: dict der aktuellen Tracks
-    - next_track_id: int, nächster verfügbarer Track-ID
-    """
+# ----------------- Tracking-Phase -----------------
+
+# --- Track-States aktualisieren (Zuordnung der Detections über Zeit) ---
+def update_tracks(matches, track_states, next_track_id, max_u_diff=20, max_v_diff=10, max_disp_history=10):
     now = time.time()
     used_tracks = set()
     
-    for det_left, det_right in matches:
+    for det_left, det_right, disp in matches:
         uL, vL = det_left['u_px'], det_left['v_px']
-        best_tid = None
-        best_dist = None
+        best_tid, best_dist = None, None
         
         # Existierende Tracks prüfen
         for tid, ts in track_states.items():
             if tid in used_tracks:
                 continue
             u_prev, v_prev = ts['left_center']
-            du = abs(uL - u_prev)
-            dv = abs(vL - v_prev)
-            
+            du, dv = abs(uL - u_prev), abs(vL - v_prev)
             if du <= max_u_diff and dv <= max_v_diff:
                 dist = du + dv
                 if best_dist is None or dist < best_dist:
-                    best_dist = dist
-                    best_tid = tid
+                    best_dist, best_tid = dist, tid
         
         if best_tid is not None:
-            # Track aktualisieren
+            # Existierender Track
             ts = track_states[best_tid]
-            ts.update({
-                'left_bbox': det_left['bbox'],
-                'right_bbox': det_right['bbox'],
-                'left_center': (uL, vL),
-                'class_id': det_left['class_id'],
-                'z_mm': det_left.get('z_mm'),
-                'last_update': now
-            })
+            ts['left_center'] = (uL, vL)
+            ts['disparities'].append(disp)
+            ts['last_update'] = now
+            det_left['track_id'] = best_tid
+            det_right['track_id'] = best_tid
             used_tracks.add(best_tid)
         else:
             # Neuer Track
             track_states[next_track_id] = {
-                'left_bbox': det_left['bbox'],
-                'right_bbox': det_right['bbox'],
                 'left_center': (uL, vL),
-                'class_id': det_left['class_id'],
-                'z_mm': det_left.get('z_mm'),
+                'disparities': deque([disp], maxlen=max_disp_history),
                 'last_update': now
             }
+            det_left['track_id'] = next_track_id
+            det_right['track_id'] = next_track_id
             used_tracks.add(next_track_id)
             next_track_id += 1
     
@@ -277,34 +259,103 @@ def update_tracks(matches, track_states, next_track_id, max_u_diff=20, max_v_dif
     to_delete = [tid for tid, ts in track_states.items() if now - ts['last_update'] > 1.0]
     for tid in to_delete:
         del track_states[tid]
-    
+
+    # --- Debug-Ausgabe aller aktiven Tracks ---
+    print("=== TRACK [DEBUG] ===")
+    for tid, ts in track_states.items():
+        print(f"Track {tid}: disparities={list(ts['disparities'])}")
+  
     return track_states, next_track_id
 
-# --- Tiefenschätzung aus Bounding Box mitte ---
-def depth_from_bbox_pair(bbox_left, bbox_right, fx, baseline_mm):
-    uL = bbox_left['u_px']
-    uR = bbox_right['u_px']
-    disp = uL - uR
+# --- Distanz aus Disparität berechnen ---
+def depth_from_disparity(track_states, fx, baseline_mm):
+    for tid, ts in track_states.items():
+        if 'disparities' in ts and ts['disparities']:
+            # Median für stabile Tiefe
+            disp_median = np.median(list(ts['disparities']))
+            z_mm = (fx * baseline_mm) / disp_median
+            ts['z_mm'] = z_mm
+        else:
+            ts['z_mm'] = None
+    return track_states
+'''
+# ----------------- Target-Auswahl-Phase -----------------
 
-    # Disparitätsbereich für gültige Tiefen (10 cm bis 90 cm)
-    z_min_mm = 100.0   # 10 cm
-    z_max_mm = 900.0   # 90 cm
-    d_max = (fx * baseline_mm) / z_min_mm   # Disparität für 10 cm
-    d_min = (fx * baseline_mm) / z_max_mm   # Disparität für 90 cm
-    margin = 0.05  # 5 % Puffer
-    d_max *= (1 + margin)
-    d_min *= (1 - margin)
-#    print(f"Valid disparity range: {d_min:.2f} - {d_max:.2f} px")
+# Track mit der geringsten Distanz auswählen und rig-zentieren
+def select_target(track_states):
 
-    # Disparität prüfen
-    if disp < d_min or disp > d_max:
+# Track mit der geringsten Distanz auswählen
+
+# evtl. Median der Disparitäten für stabile Tiefe
+
+# Rig-zentrierter Offset in Pixeln
+cx_bar = 0.5 * (cxL + cxR)
+u_rig = uL - 0.5 * disp
+u_offset_px = u_rig - cx_bar
+
+# Winkel berechnen (Radiant und Grad)
+angle_rad = math.atan(u_offset_px / fx)
+angle_deg = math.degrees(angle_rad)
+
+# ----------------- Steuerungs-/Sende-Phase -----------------
+
+# Zielparameter mit EWMA glätten
+def smooth_target(u_px, z_mm, last_committed):
+
+# Payload dict mit geglätteten Werten erstellen
+def build_payload(det, smoothed_u, smoothed_z):
+
+# --- Payload an den Raspberry Pi senden ---
+def send_payload(det, track_states, robot_socket):
+    global last_committed
+
+    if det is None or 'track_id' not in det:
         return None
-    
-    z_mm = (fx * baseline_mm) / disp    # Triangulation
-    return z_mm, disp
 
-# --- Tracking und Senden ---
+    tid = det['track_id']
+    ts = track_states.get(tid)
+    if ts is None or not ts['disparities']:
+        return None
 
+    # Durchschnittliche Disparität
+    avg_disp = sum(ts['disparities']) / len(ts['disparities'])
+    z_mm = depth_from_disparity(avg_disp, fx, baseline_mm)
+    if z_mm is None:
+        return None
+
+    u_px = det['u_px']
+
+    # Glättung
+    if last_committed is None:
+        smoothed_u = u_px
+        smoothed_z = z_mm
+    else:
+        u_prev, z_prev = last_committed
+        if abs(z_mm - z_prev) > RESET_Z_THRESHOLD_MM:
+            smoothed_u = u_px
+            smoothed_z = z_mm
+        else:
+            smoothed_u = ALPHA_U_TRACK * u_px + (1 - ALPHA_U_TRACK) * u_prev
+            smoothed_z = ALPHA_Z_TRACK * z_mm + (1 - ALPHA_Z_TRACK) * z_prev
+
+    last_committed = (smoothed_u, smoothed_z)
+
+    payload = {
+        'track_id': tid,
+        'class_id': det['class_id'],
+        'class_name': det['class_name'],
+        'u_px': smoothed_u,
+        'z_mm': smoothed_z,
+        'timestamp': time.time()
+    }
+
+    try:
+        robot_socket.send_json(payload, flags=zmq.NOBLOCK)
+        print(f"[SENT] {json.dumps(payload)}")
+    except zmq.Again:
+        print("[WARN] Robot socket busy, message dropped.")
+    return payload
+'''
 # ----------------- Debugfunktionen -----------------
 
 # --- Bounding Boxes inkl. Abstand (z_mm falls vorhanden) zeichnen ---
@@ -312,10 +363,27 @@ def draw_processed_detections(img, detections, side='left', color=(0,255,0), tra
     # --- Beide Bilder nebeneinander zeichnen ---
     if side == "both":
         left_img, right_img = img  # Tuple entpacken
+        left_dets = detections.get("left", [])
+        right_dets = detections.get("right", [])
+
+        # Rekursive Aufrufe für beide Seiten
         left_img = draw_processed_detections(left_img, detections["left"], side="left", color=(0,255,0), track_states=track_states)
         right_img = draw_processed_detections(right_img, detections["right"], side="right", color=(255,200,0), track_states=track_states)
-
+        # Beide Bilder nebeneinander kombinieren
         combined = np.hstack((left_img, right_img))
+        
+        # Disparity-Linien zwischen korrespondierenden Detections zeichnen
+        for det_left in left_dets:
+            if 'track_id' in det_left and 'right_bbox' in det_left:
+                tid = det_left['track_id']
+                # Index der Farbe im Palette-Rad
+                col = track_palette[tid % len(track_palette)]
+                # Mittelpunkt links/rechts
+                uL, vL = int(det_left['u_px']), int(det_left['v_px'])
+                uR = int(det_left['right_bbox'][0] + (det_left['right_bbox'][2]-det_left['right_bbox'][0])/2)
+                vR = vL # rektifiziert → gleiche v-Koordinate
+                # Linie zeichnen (linkes Bild → rechtes Bild)
+                cv2.line(combined, (uL, vL), (uR + left_img.shape[1], vR), col, 2)
         return combined
 
     # --- Einzelbild Fall (left oder right) ---
@@ -331,19 +399,18 @@ def draw_processed_detections(img, detections, side='left', color=(0,255,0), tra
         cv2.circle(img, (u, v), 4, (0, 0, 255), -1)
         # Label
         label = f"{cls_name} {conf:.2f}"
-        if det.get('z_mm') is not None:
-            label += f" z={det['z_mm']:.0f}mm"
-
         # Track-ID anzeigen
-        if track_states is not None:
-            for tid, ts in track_states.items():
-                if ts['left_bbox'] == det['bbox']:
-                    label += f" | ID:{tid}"
-                    break
+        if 'track_id' in det:
+            tid = det['track_id']
+            label += f" | ID:{tid}"
+            # Distanz aus Track-States
+            if track_states is not None:
+                ts = track_states.get(tid)
+                if ts is not None and 'z_mm' in ts and ts['z_mm'] is not None:
+                    label += f" | z={ts['z_mm']:.0f}mm"
 
         cv2.putText(img, label, (x1, max(0, y1 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
     return img
 
 '''
@@ -416,8 +483,6 @@ try:
         message = get_latest_message(socket, poller, timeout_ms=15)
         if message is None:
             continue
-        
-        frame_idx += 1
 
         # Header extrahieren
         header_data = message[:HEADER_SIZE]
@@ -485,15 +550,19 @@ try:
         processed_left = build_processed_detections(raw_dets_left, CLASS_NAMES)
         processed_right = build_processed_detections(raw_dets_right, CLASS_NAMES)
 
-        # Stereo-Matching
+        # --- Stereo-Matching der Bounding Boxes ---
         matches = match_bboxes(processed_left, processed_right, fx=fx, baseline_mm=baseline_mm)
 
         # Track-Update
         track_states, next_track_id = update_tracks(matches, track_states, next_track_id)
-        print(f"[DEBUG] Tracks: {len(track_states)} | Matches: {len(matches)} | Detections L:{len(processed_left)} R:{len(processed_right)}")
+
+        # --- Tiefenberechnung für alle aktiven Tracks ---
+        track_states = depth_from_disparity(track_states, fx, baseline_mm)
+
+#        print(f"[DEBUG] Tracks: {len(track_states)} | Matches: {len(matches)} | Detections L:{len(processed_left)} R:{len(processed_right)}")
 
 
-        #  Senden 
+        #  --- Senden des Tracks mit der geringsten Distanz ---
 
 
 
@@ -505,18 +574,18 @@ try:
 # ----------------- CLI-Argumente für Debug-Ausgaben nutzen -----------------
 
         # YOLO-Detections
-        if args.debug_yolo:
-            if args.debug_yolo == 'left':
+        if args.debug_view:
+            if args.debug_view == 'left':
                 left_img = draw_processed_detections(
                     left_img, processed_left, side='left', color=(0,255,0), track_states=track_states)
                 cv2.imshow("YOLO Detections Left", left_img)
 
-            elif args.debug_yolo == 'right':
+            elif args.debug_view == 'right':
                 right_img = draw_processed_detections(
                     right_img, processed_right, side='right', color=(255,200,0), track_states=track_states)
                 cv2.imshow("YOLO Detections Right", right_img)
 
-            elif args.debug_yolo == 'both':
+            elif args.debug_view == 'both':
                 combined = draw_processed_detections(
                     (left_img, right_img),
                     {"left": processed_left, "right": processed_right},
