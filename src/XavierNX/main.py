@@ -3,8 +3,7 @@ Hauptskript:
 - Empfängt Bilder der Stereokamera (links & rechts) vom Jetson Nano
 - Erkennt Objekte und zeichnet Bounding Boxen
 - Bestimmt die Distanz zu den Objekten mittels Triangulation und Stereodisparität
-- Bietet optional Debug-Ausgaben (Anzeige der Bilder oder Disparitätskarte, Aufzeichnung von Frames)
-- Misst die FPS
+- Bietet optional Debug-Ausgaben (Anzeige der Bilder oder und Korrespondenzen, Aufzeichnung von Frames, FPS-Messung)
 - Sendet relevante, geglättete Bewegungsdaten an den Raspberry Pi
 """
 
@@ -54,12 +53,6 @@ robot_socket.setsockopt(zmq.SNDHWM, 4)   # max queued messages before dropping
 robot_socket.setsockopt(zmq.LINGER, 0)   # kein blockierendes Schließen
 robot_socket.connect(f"tcp://192.168.123.161:5560")
 
-# Glättungsfaktoren / EWMA Faktor 0..1 -> höher = reaktiver, niedriger = ruhiger
-ALPHA_U_TRACK = 0.6             # Glättung für u_px (horizontale Position)
-ALPHA_Z_TRACK = 0.4             # Glättung für z_mm (Distanz)
-last_committed = None           # Globaler Glättungsstatus anhand letzter Werte
-RESET_Z_THRESHOLD_MM = 250.0    # wenn neuer z mehr ist, dann Reset
-
 # --- CLI Parser-Argumente definieren ---
 parser = argparse.ArgumentParser(description="Empfängt Bilder, führt Objekterkennung durch und führt optional Debugfunktionen aus.")
 parser.add_argument('--debug-view', choices=['left','right','both'],
@@ -96,17 +89,23 @@ fs.release()
 
 # Einzelwerte extrahieren
 fx = float(left_kfe[0, 0])                    # Fokalweite in Pixeln
-cx = float(left_kfe[0, 2])
+cx = float(left_kfe[0, 2])                    # Bildzentrum horizontal
 baseline_mm = float(abs(translation[0, 0]))   # Basislinie in mm
 
 # --- Tracking-Variablen ---
 track_states = {}  # Track-Status (id -> state dict)
 next_track_id = 0  # Nächste verfügbare Track-ID
+smooth_states = {} # geglättete Werte
 
 # Farbpalette für die Track-ID Disparitäten (RGB tuples)
 track_palette = [(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255),
                          (128,0,0), (0,128,0), (0,0,128), (128,128,0), (128,0,128), (0,128,128),
                          (64,64,64), (192,192,192), (255,165,0), (75,0,130), (255,20,147)]
+
+# Glättungsfaktoren / EWMA Faktor 0..1 -> höher = reaktiver, niedriger = ruhiger
+ALPHA_U_TRACK = 0.7             # Glättung für u_px (horizontale Position)
+ALPHA_RAD_TRACK = 0.6           # Glättung für angle_rad (Winkel)
+ALPHA_Z_TRACK = 0.4             # Glättung für z_mm (Distanz)
 
 # --- Timeout für das Senden an den Raspberry Pi ---
 STALE_TIMEOUT = 7.0  # Sekunden ohne echte YOLO-Detection → nichts senden
@@ -151,9 +150,9 @@ def build_processed_detections(raw_dets, class_names):
         })
     return processed
 
-# --- Bounding Boxes paaren (Stereo-Matching links/rechts) ---
+# --- Bounding Boxes paaren (Stereo-Matching links/rechts) und Disparitätsberechnung ---
 def match_bboxes(processed_left, processed_right, fx, baseline_mm,
-                 max_v_diff=3.5, height_ratio_thresh=(0.75, 1.35), z_range_mm=(100, 900)):
+                 max_v_diff=8.5, height_ratio_thresh=(0.75, 1.25), z_range_mm=(100, 900)):
     matches = []
     used = set()
 
@@ -215,7 +214,7 @@ def match_bboxes(processed_left, processed_right, fx, baseline_mm,
 # ----------------- Tracking-Phase -----------------
 
 # --- Track-States aktualisieren (Zuordnung der Detections über Zeit) ---
-def update_tracks(matches, track_states, next_track_id, max_u_diff=20, max_v_diff=10, max_disp_history=10):
+def update_tracks(matches, track_states, next_track_id, max_u_diff=30, max_v_diff=20, max_disp_history=20):
     now = time.time()
     used_tracks = set()
     
@@ -229,6 +228,7 @@ def update_tracks(matches, track_states, next_track_id, max_u_diff=20, max_v_dif
                 continue
             u_prev, v_prev = ts['left_center']
             du, dv = abs(uL - u_prev), abs(vL - v_prev)
+            # Filter: maximale Abweichungen
             if du <= max_u_diff and dv <= max_v_diff:
                 dist = du + dv
                 if best_dist is None or dist < best_dist:
@@ -259,12 +259,6 @@ def update_tracks(matches, track_states, next_track_id, max_u_diff=20, max_v_dif
     to_delete = [tid for tid, ts in track_states.items() if now - ts['last_update'] > 1.0]
     for tid in to_delete:
         del track_states[tid]
-
-    # --- Debug-Ausgabe aller aktiven Tracks ---
-    print("=== TRACK [DEBUG] ===")
-    for tid, ts in track_states.items():
-        print(f"Track {tid}: disparities={list(ts['disparities'])}")
-  
     return track_states, next_track_id
 
 # --- Distanz aus Disparität berechnen ---
@@ -274,38 +268,108 @@ def depth_from_disparity(track_states, fx, baseline_mm):
             # Median für stabile Tiefe
             disp_median = np.median(list(ts['disparities']))
             z_mm = (fx * baseline_mm) / disp_median
+            ts['disp_median'] = disp_median
             ts['z_mm'] = z_mm
         else:
+            ts['disp_median'] = None
             ts['z_mm'] = None
+
+#        print(f"[DEBUG] Track {tid}: disparities={list(ts['disparities'])}, disp_median={ts['disp_median']} | z_mm={ts['z_mm']}")
     return track_states
-'''
+
 # ----------------- Target-Auswahl-Phase -----------------
 
 # Track mit der geringsten Distanz auswählen und rig-zentieren
-def select_target(track_states):
+def select_target(track_states, fx, cx):
+    target = None
+    min_z = float('inf')
+    
+    # Track mit der geringsten Distanz auswählen 
+    for tid, ts in track_states.items():
+        if ts.get('z_mm') is None:
+            continue
+            
+        z_mm = ts['z_mm']
+        if z_mm < min_z:
+            min_z = z_mm
+            target = (tid, ts)
 
-# Track mit der geringsten Distanz auswählen
+    if target is None:
+        return None
 
-# evtl. Median der Disparitäten für stabile Tiefe
+    tid, ts = target
+    uL, vL = ts['left_center']
+    disp = ts.get('disp_median')
+    if disp is None:
+        return None
 
-# Rig-zentrierter Offset in Pixeln
-cx_bar = 0.5 * (cxL + cxR)
-u_rig = uL - 0.5 * disp
-u_offset_px = u_rig - cx_bar
+    # Rig-zentrierter Offset in Pixeln
+    u_rig = uL - 0.5 * disp
+    u_offset_px = float(u_rig - cx)
 
-# Winkel berechnen (Radiant und Grad)
-angle_rad = math.atan(u_offset_px / fx)
-angle_deg = math.degrees(angle_rad)
+    # Normierung auf -1..1
+    u_offset_norm = u_offset_px / cx
 
+    # Winkel berechnen (Radiant und Grad)
+    angle_rad = math.atan2(u_offset_px, fx)
+    angle_deg = math.degrees(angle_rad)
+
+    return {
+        'track_id': tid,
+        'u_offset_px': u_offset_px,     # rig-zentrierter Offset
+        'u_offset_norm': u_offset_norm, # normierter Offset
+        'angle_rad': angle_rad,         # Winkel in Radiant
+        'angle_deg': angle_deg,         # Winkel in Grad
+        'z_mm': z_mm,                   # Distanz
+    }
 # ----------------- Steuerungs-/Sende-Phase -----------------
 
 # Zielparameter mit EWMA glätten
-def smooth_target(u_px, z_mm, last_committed):
+def smooth_target(target, smooth_states,
+                  alpha_u=ALPHA_U_TRACK,
+                  alpha_norm=ALPHA_U_TRACK,
+                  alpha_rad=ALPHA_RAD_TRACK,
+                  alpha_z=ALPHA_Z_TRACK):
+    if target is None:
+        return None, smooth_states 
+    
+    tid = target['track_id']
+    u_px, u_norm, angle_rad, z_mm = (
+        target['u_offset_px'],
+        target['u_offset_norm'],
+        target['angle_rad'],
+        target['z_mm']
+    )
+    
+    # Erster Eintrag: Initialisierung
+    if tid not in smooth_states:
+        smooth_states[tid] = {
+            'u_offset_px': u_px,
+            'u_offset_norm': u_norm,
+            'angle_rad': angle_rad,
+            'z_mm': z_mm
+        }
+    else:
+        # EWMA Glättung
+        prev = smooth_states[tid]
+        smooth_states[tid]['u_offset_px'] = alpha_u * u_px + (1 - alpha_u) * prev['u_offset_px']
+        smooth_states[tid]['u_offset_norm'] = alpha_norm * u_norm + (1 - alpha_norm) * prev['u_offset_norm']
+        smooth_states[tid]['angle_rad']   = alpha_rad * angle_rad + (1 - alpha_rad) * prev['angle_rad']
+        smooth_states[tid]['z_mm']        = alpha_z * z_mm + (1 - alpha_z) * prev['z_mm']
 
-# Payload dict mit geglätteten Werten erstellen
-def build_payload(det, smoothed_u, smoothed_z):
+    # Geglättete Werte zurückgeben für Steuerung
+    smoothed = {
+        'track_id': tid,
+        'smoothed_u': smooth_states[tid]['u_offset_px'],
+        'smoothed_u_norm': smooth_states[tid]['u_offset_norm'],
+        'smoothed_angle_rad': smooth_states[tid]['angle_rad'],
+        'smoothed_angle_deg': math.degrees(smooth_states[tid]['angle_rad']),
+        'smoothed_z_mm': smooth_states[tid]['z_mm']
+    }
+    return smoothed, smooth_states
+'''
 
-# --- Payload an den Raspberry Pi senden ---
+# --- Payload (smoothed-Dict) an den Raspberry Pi senden ---
 def send_payload(det, track_states, robot_socket):
     global last_committed
 
@@ -364,7 +428,6 @@ def draw_processed_detections(img, detections, side='left', color=(0,255,0), tra
     if side == "both":
         left_img, right_img = img  # Tuple entpacken
         left_dets = detections.get("left", [])
-        right_dets = detections.get("right", [])
 
         # Rekursive Aufrufe für beide Seiten
         left_img = draw_processed_detections(left_img, detections["left"], side="left", color=(0,255,0), track_states=track_states)
@@ -402,7 +465,7 @@ def draw_processed_detections(img, detections, side='left', color=(0,255,0), tra
         # Track-ID anzeigen
         if 'track_id' in det:
             tid = det['track_id']
-            label += f" | ID:{tid}"
+            label = f"ID:{tid}"
             # Distanz aus Track-States
             if track_states is not None:
                 ts = track_states.get(tid)
@@ -413,25 +476,6 @@ def draw_processed_detections(img, detections, side='left', color=(0,255,0), tra
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return img
 
-'''
-# gesendeten Track zeichnen
-def draw_payload_on_left(img, payload, track_states, color_yolo=(0,255,0), color_sort=(0,165,255)):
-    if img is None or payload is None:
-        return img
-    det = payload.get('detection', {})
-    tid = det.get('track_id', None)
-    if tid is None:
-        return img
-    ts = track_states.get(tid)
-    if ts is None or 'bbox' not in ts:
-        return img
-    color = color_yolo if det.get('source') == 'yolo' else color_sort
-    x1,y1,x2,y2 = ts['bbox']
-    label = f"send trk{tid} ({det.get('source','')})"
-    cv2.rectangle(img, (x1,y1), (x2,y2), color, 2)
-    cv2.putText(img, label, (x1, y1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-    return img
-'''
 # Frame-Größe & Typen debuggen
 def print_debug_frame_info(left_width, left_height, right_width, right_height, left_type, right_type):
     print(f"Left Frame: {left_width}x{left_height} | Right Frame: {right_width}x{right_height}")
@@ -558,16 +602,29 @@ try:
 
         # --- Tiefenberechnung für alle aktiven Tracks ---
         track_states = depth_from_disparity(track_states, fx, baseline_mm)
-
-#        print(f"[DEBUG] Tracks: {len(track_states)} | Matches: {len(matches)} | Detections L:{len(processed_left)} R:{len(processed_right)}")
-
-
-        #  --- Senden des Tracks mit der geringsten Distanz ---
+        
+        # --- Zielauswahl (Track mit geringster Distanz) ---
+        target = select_target(track_states, fx, cx)
+        
+        # --- Zielparameter glätten ---
+        smoothed_target, smooth_states = smooth_target(target, smooth_states)
+        '''
+        # Debug-Ausgabe
+        if target and smoothed_target:
+            print(
+                f"[TRACK {target['track_id']}] "
+                f"angle: raw={target['angle_rad']:.2f}rad, {target['angle_deg']:.1f}° | smooth={smoothed_target['smoothed_angle_rad']:.2f}rad, {smoothed_target['smoothed_angle_deg']:.1f}° || "
+                f"offset: raw={target['u_offset_px']:.1f}px | smooth={smoothed_target['smoothed_u']:.1f}px || "
+                f"normierter offset: raw={target['u_offset_norm']:.2f} | smooth={smoothed_target['smoothed_u_norm']:.2f} || "
+                f"z: raw={target['z_mm']:.0f}mm | smooth={smoothed_target['smoothed_z_mm']:.0f}mm || "
+            )
+        '''
+        #  --- Senden des Targets (Track mit der geringsten Distanz) ---
 
 
 
         # --- Ergebniszeichnung ---
-        # 1) YOLO-Detections
+        # YOLO-Detections
         left_img = draw_processed_detections(left_img, detections_for_processing)
         right_img = draw_processed_detections(right_img, detections_for_processing)
 
@@ -609,6 +666,14 @@ try:
                 frame_count, last_fps_time, seconds_elapsed, fps_outputs, fps_list
             )
 
+        # --- Draw Detections für (both-)Aufnahme vorbereiten ---
+        display_img = draw_processed_detections(
+            (left_img, right_img), 
+            detections={"left": processed_left, "right": processed_right}, 
+            side="both", 
+            track_states=track_states
+        )
+
         # Tastendruck für Debug-Aufnahmen
         key = cv2.waitKey(1) & 0xFF
         if args.debug_img and key in [ord('l'), ord('r'), ord('c')]:
@@ -617,8 +682,7 @@ try:
             elif key == ord('r'):
                 capture_frame(right_img, args.debug_img)
             elif key == ord('c'):
-                combined = np.hstack((left_img, right_img))
-                capture_frame(combined, args.debug_img)
+                capture_frame(display_img, args.debug_img)
         
         # --- Escape-Taste zum Beenden ---
         if key == 27:  # ESC
