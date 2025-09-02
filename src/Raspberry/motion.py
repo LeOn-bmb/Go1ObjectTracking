@@ -23,7 +23,7 @@ except Exception as e:
 # --- ZeroMQ (PULL vom Xavier NX) ---
 context = zmq.Context()
 socket = context.socket(zmq.PULL)
-socket.setsockopt(zmq.RCVHWM, 4)
+socket.setsockopt(zmq.RCVHWM, 15)
 socket.setsockopt(zmq.LINGER, 0)
 socket.bind("tcp://*:5560")  # auf Verbindung warten
 
@@ -65,6 +65,7 @@ deriv_tau = 0.02
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
+# --- PID-Regelung zum gieren ---
 def compute_pid(signal, dt, source):
     """
     PID-Regler. Fehler = -signal (Ziel: 0).
@@ -101,28 +102,20 @@ def compute_pid(signal, dt, source):
     yaw = clamp(yaw, -MAX_YAW, MAX_YAW)
     return yaw
 
-
+# --- PID-relevante Werte extrahieren ---
 def extract_angle_or_unorm(data):
-    """
-    Priorisiere angle_rad für PID. Fallback auf u_norm.
-    Liefert value & source aus data.
-    """
-    det = data.get("detection") or data.get("detections")
-    if det is None:
+    if data is None:
         return None, None
 
-    candidate = det if isinstance(det, dict) else (det[0] if len(det) > 0 else None)
-    if candidate is None:
-        return None, None
-
-    angle_rad = candidate.get("angle_rad")
+    # Primär: geglätteter Winkel
+    angle_rad = data.get("smoothed_angle_rad")
     if angle_rad is not None:
         return float(angle_rad), "angle_rad"
 
-    u_norm = candidate.get("u_norm")
+    # Fallback: geglättete Normierung der u-Position
+    u_norm = data.get("smoothed_u_norm")
     if u_norm is not None:
         return float(u_norm), "u_norm"
-
     return None, None
 
 try:
@@ -141,19 +134,21 @@ try:
             continue
 
         # Ausgabe
-        det = data.get("detection") or data.get("detections")
-        if det is not None:
-            dets = [det] if isinstance(det, dict) else det
+        if data is not None:
+            dets = [data] if isinstance(data, dict) else data
             for i, d in enumerate(dets):
-                cname = d.get("class_name")
-                conf = d.get("conf")
-                angle_rad = d.get("angle_rad")
-                u_norm = d.get("u_norm")
+                track_id    = d.get("track_id")
+                u           = d.get("smoothed_u")
+                u_norm      = d.get("smoothed_u_norm")
+                angle_rad   = d.get("smoothed_angle_rad")
+                angle_deg   = d.get("smoothed_angle_deg")
+                z_mm        = d.get("smoothed_z_mm")
+
                 if args.verbose:
-                    print(f"[INFO] Det {i}: class={cname} conf={conf:.2f} angle_rad={angle_rad:.3f} u_norm={u_norm:.3f}")
+                    print(f"[INFO] Det {i}: ID={track_id} || Angle_rad={angle_rad:.2f} || U_norm={u_norm:.2f} || Z_mm={z_mm:.0f}mm")
         else:
             print("[INFO] Keine Detektionen im Payload.")
-
+        '''
         # PID auf Winkel
         angle, source = extract_angle_or_unorm(data)
         if angle is None:
@@ -181,7 +176,7 @@ try:
                 print(f"[INFO] yaw_cmd={yaw_cmd:.3f}")
         except Exception as e:
             print(f"[WARN] udp.Send gescheitert: {e}")
-
+        '''
 except KeyboardInterrupt:
     print("\n[INFO] Durch Benutzer beendet. Sende Stopp-Befehl an Roboter.")
     try:

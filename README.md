@@ -69,6 +69,21 @@ cd Go1ObjectTracking;
 ```
 
 🏁 Hauptprogramm auf dem Xavier NX starten:
+
+🔎 **Grafisches Debugging aktivieren**  
+Für die Nutzung der Debug-Ansicht über den CLI-Parameter `--debug-view (left, right, both)` muss zunächst **X11-Forwarding** aktiviert werden:
+
+1. Mit aktivem X11-Forwarding verbinden: ssh -X <user>@<XavierNX_IP> 
+2. Display-Variable exportieren:  
+Die eigene IPv4-Adresse kann in der Shell mit folgendem Befehl ermittelt werden:
+- unter Linux/macOS: `ifconfig`  
+- unter Windows (PowerShell): `ipconfig`
+
+**Beispiel:**  
+Falls dein Rechner die IP `192.168.0.42` hat, lautet der Befehl: export DISPLAY=192.168.0.42:0
+
+Damit können die Debug-Fenster des Programms auch remote dargestellt werden.
+
 ```
 cd Go1ObjectTracking/src/XavierNX; 
 python3 main.py

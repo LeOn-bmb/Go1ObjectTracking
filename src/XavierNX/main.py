@@ -49,7 +49,7 @@ print("Empfänger bereit...")
 
 # ZeroMQ (PUSH zum Raspberry)
 robot_socket = context.socket(zmq.PUSH)
-robot_socket.setsockopt(zmq.SNDHWM, 4)   # max queued messages before dropping
+robot_socket.setsockopt(zmq.SNDHWM, 15)   # max queued messages before dropping
 robot_socket.setsockopt(zmq.LINGER, 0)   # kein blockierendes Schließen
 robot_socket.connect(f"tcp://192.168.123.161:5560")
 
@@ -57,8 +57,8 @@ robot_socket.connect(f"tcp://192.168.123.161:5560")
 parser = argparse.ArgumentParser(description="Empfängt Bilder, führt Objekterkennung durch und führt optional Debugfunktionen aus.")
 parser.add_argument('--debug-view', choices=['left','right','both'],
                     help='YOLO-Ergebnisse, Track-Ids und Distanz im linken, rechten oder beiden Bildern anzeigen')
-parser.add_argument('--debug-payload', choices=['left','right','both'],
-                    help='Den gesendeten Track (Payload) im linken Bild markieren')
+parser.add_argument('--debug-values', action='store_true',
+                    help='Bewegungswerte, die aus der smoothed_ an den Raspberry weitergeleitet werden (roh vs. geglättet)')
 parser.add_argument('--debug-size', action='store_true',
                     help='Frame-Größen, Typen und Kalibrierungsparameter debuggen')
 parser.add_argument('--debug-fps', action='store_true',
@@ -108,7 +108,10 @@ ALPHA_RAD_TRACK = 0.6           # Glättung für angle_rad (Winkel)
 ALPHA_Z_TRACK = 0.4             # Glättung für z_mm (Distanz)
 
 # --- Timeout für das Senden an den Raspberry Pi ---
-STALE_TIMEOUT = 7.0  # Sekunden ohne echte YOLO-Detection → nichts senden
+STALE_TIMEOUT = 7.0  # Sekunden ohne YOLO-Detection → nichts senden
+last_detection_time = time.time()
+last_valid_target = None
+stale_sent = False
 
 # ----------------- Receive-Phase -----------------
 
@@ -341,8 +344,9 @@ def smooth_target(target, smooth_states,
         target['z_mm']
     )
     
-    # Erster Eintrag: Initialisierung
+    # # State nur für das aktuelle Target verwalten / Erster Eintrag: Initialisierung
     if tid not in smooth_states:
+        smooth_states.clear()
         smooth_states[tid] = {
             'u_offset_px': u_px,
             'u_offset_norm': u_norm,
@@ -352,10 +356,10 @@ def smooth_target(target, smooth_states,
     else:
         # EWMA Glättung
         prev = smooth_states[tid]
-        smooth_states[tid]['u_offset_px'] = alpha_u * u_px + (1 - alpha_u) * prev['u_offset_px']
+        smooth_states[tid]['u_offset_px']   = alpha_u * u_px + (1 - alpha_u) * prev['u_offset_px']
         smooth_states[tid]['u_offset_norm'] = alpha_norm * u_norm + (1 - alpha_norm) * prev['u_offset_norm']
-        smooth_states[tid]['angle_rad']   = alpha_rad * angle_rad + (1 - alpha_rad) * prev['angle_rad']
-        smooth_states[tid]['z_mm']        = alpha_z * z_mm + (1 - alpha_z) * prev['z_mm']
+        smooth_states[tid]['angle_rad']     = alpha_rad * angle_rad + (1 - alpha_rad) * prev['angle_rad']
+        smooth_states[tid]['z_mm']          = alpha_z * z_mm + (1 - alpha_z) * prev['z_mm']
 
     # Geglättete Werte zurückgeben für Steuerung
     smoothed = {
@@ -367,59 +371,43 @@ def smooth_target(target, smooth_states,
         'smoothed_z_mm': smooth_states[tid]['z_mm']
     }
     return smoothed, smooth_states
-'''
 
-# --- Payload (smoothed-Dict) an den Raspberry Pi senden ---
-def send_payload(det, track_states, robot_socket):
-    global last_committed
+# Target (Track mit der geringsten Distanz) an den Raspberry Pi senden
+def send_motionValues(robot_socket, smoothed_target, target, 
+                      stale_timeout=STALE_TIMEOUT):
 
-    if det is None or 'track_id' not in det:
-        return None
+    global last_detection_time, last_valid_target, stale_sent
 
-    tid = det['track_id']
-    ts = track_states.get(tid)
-    if ts is None or not ts['disparities']:
-        return None
-
-    # Durchschnittliche Disparität
-    avg_disp = sum(ts['disparities']) / len(ts['disparities'])
-    z_mm = depth_from_disparity(avg_disp, fx, baseline_mm)
-    if z_mm is None:
-        return None
-
-    u_px = det['u_px']
-
-    # Glättung
-    if last_committed is None:
-        smoothed_u = u_px
-        smoothed_z = z_mm
+    if target and smoothed_target:
+        # Neue Detection vorhanden → aktuelle Werte senden
+        try:
+            robot_socket.send_json(smoothed_target, flags=zmq.NOBLOCK)
+            last_detection_time = time.time()
+            last_valid_target = smoothed_target
+            stale_sent = False
+        except zmq.Again:
+            print("[WARN] Sendepuffer voll – smoothed_target wurde verworfen")
+        except Exception as e:
+            print(f"Fehler beim Senden an Raspberry: {e}")
     else:
-        u_prev, z_prev = last_committed
-        if abs(z_mm - z_prev) > RESET_Z_THRESHOLD_MM:
-            smoothed_u = u_px
-            smoothed_z = z_mm
-        else:
-            smoothed_u = ALPHA_U_TRACK * u_px + (1 - ALPHA_U_TRACK) * u_prev
-            smoothed_z = ALPHA_Z_TRACK * z_mm + (1 - ALPHA_Z_TRACK) * z_prev
+        # Keine aktuelle Detection → prüfen ob Timeout erreicht
+        elapsed = time.time() - last_detection_time
 
-    last_committed = (smoothed_u, smoothed_z)
+        if elapsed <= stale_timeout and last_valid_target is not None:
+            # Innerhalb des Timeouts → letzten gültigen Wert weitersenden
+            try:
+                robot_socket.send_json(last_valid_target, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                print("[WARN] Sendepuffer voll – last_valid_target wurde verworfen")
+        elif elapsed > stale_timeout and not stale_sent:
+            # Timeout überschritten → einmalig STOP senden
+            try:
+                robot_socket.send_json(None, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                print("[WARN] Sendepuffer voll – STOP wurde verworfen")
+            print(f"[STALE] Keine YOLO-Detektion seit {elapsed:.1f}s → Stop an Roboter")
+            stale_sent = True
 
-    payload = {
-        'track_id': tid,
-        'class_id': det['class_id'],
-        'class_name': det['class_name'],
-        'u_px': smoothed_u,
-        'z_mm': smoothed_z,
-        'timestamp': time.time()
-    }
-
-    try:
-        robot_socket.send_json(payload, flags=zmq.NOBLOCK)
-        print(f"[SENT] {json.dumps(payload)}")
-    except zmq.Again:
-        print("[WARN] Robot socket busy, message dropped.")
-    return payload
-'''
 # ----------------- Debugfunktionen -----------------
 
 # --- Bounding Boxes inkl. Abstand (z_mm falls vorhanden) zeichnen ---
@@ -608,20 +596,9 @@ try:
         
         # --- Zielparameter glätten ---
         smoothed_target, smooth_states = smooth_target(target, smooth_states)
-        '''
-        # Debug-Ausgabe
-        if target and smoothed_target:
-            print(
-                f"[TRACK {target['track_id']}] "
-                f"angle: raw={target['angle_rad']:.2f}rad, {target['angle_deg']:.1f}° | smooth={smoothed_target['smoothed_angle_rad']:.2f}rad, {smoothed_target['smoothed_angle_deg']:.1f}° || "
-                f"offset: raw={target['u_offset_px']:.1f}px | smooth={smoothed_target['smoothed_u']:.1f}px || "
-                f"normierter offset: raw={target['u_offset_norm']:.2f} | smooth={smoothed_target['smoothed_u_norm']:.2f} || "
-                f"z: raw={target['z_mm']:.0f}mm | smooth={smoothed_target['smoothed_z_mm']:.0f}mm || "
-            )
-        '''
-        #  --- Senden des Targets (Track mit der geringsten Distanz) ---
 
-
+        # --- Parameter senden ---
+        send_motionValues(robot_socket, smoothed_target, target)
 
         # --- Ergebniszeichnung ---
         # YOLO-Detections
@@ -648,12 +625,17 @@ try:
                     {"left": processed_left, "right": processed_right},
                     side='both', track_states=track_states)
                 cv2.imshow("YOLO Detections Both", combined)
-        '''
-        # Payload zeichnen
-        if args.debug_payload and payload is not None:
-            left_img_vis = draw_payload_on_left(left_img_vis, payload, track_states)
-            cv2.imshow("Payload", left_img_vis)
-        '''
+        
+        # Debug-Ausgabe
+        if args.debug_values and target and smoothed_target:
+            print(
+                f"[TRACK {target['track_id']}] "
+                f"angle: raw={target['angle_rad']:.2f}rad, {target['angle_deg']:.1f}° | smooth={smoothed_target['smoothed_angle_rad']:.2f}rad, {smoothed_target['smoothed_angle_deg']:.1f}° || "
+                f"offset: raw={target['u_offset_px']:.1f}px | smooth={smoothed_target['smoothed_u']:.1f}px || "
+                f"normierter offset: raw={target['u_offset_norm']:.2f} | smooth={smoothed_target['smoothed_u_norm']:.2f} || "
+                f"z: raw={target['z_mm']:.0f}mm | smooth={smoothed_target['smoothed_z_mm']:.0f}mm || "
+            )
+
         # Frame-Size Debug (einmalig)
         if args.debug_size and size_printed == 0:
             print_debug_frame_info(left_width, left_height, right_width, right_height, left_type, right_type)
