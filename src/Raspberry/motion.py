@@ -3,7 +3,6 @@ ZeroMQ PULL Receiver + PID-basierte Yaw-Nachführung für Unitree (High-Level).
 - Empfängt JSON per ZeroMQ (vom Xavier NX)
 - Führt PID primär auf angle_rad aus (Fallback: u_norm) -> cmd.yawSpeed
 - Sendet HighCmd per robot_interface (UDP)
-- Stale-Timeout: nach keiner Detection > STALE_TIMEOUT wird Drehung gestoppt und Integrator zurückgesetzt.
 """
 
 import zmq
@@ -51,9 +50,18 @@ Kp = 1.0
 Ki = 0.3
 Kd = 0.02
 
-MAX_YAW = 1.0               # Max yawSpeed (rad/s)
-DEADBAND_ANGLE = 0.035      # rad (~2°)
-DEADBAND_UNORM = 0.03       # 3 % halbe Bildbreite
+MAX_YAW = 0.6               # Max yawSpeed (rad/s)
+
+#  Hysterese-Schwellen 
+ANGLE_INNER = 0.07    # rad (~4°) -> "gut genug zentriert"
+ANGLE_OUTER = 0.1     # rad (~5.7°) -> erst dann wieder aktiv werden
+
+UNORM_INNER = 0.03    # norm (~3%) 
+UNORM_OUTER = 0.04    # norm (~4%)
+
+# Hysterese-Zustände merken
+inside_dead_angle = False
+inside_dead_unorm = False
 
 integrator = 0.0
 prev_error = 0.0
@@ -62,26 +70,61 @@ integrator_limit = MAX_YAW * 2.0  # Anti-Windup
 deriv_filtered = 0.0
 deriv_tau = 0.02
 
+# --- PID-relevante Werte extrahieren ---
+def extract_angle_or_unorm(data):
+    if data is None:
+        return None, None
+
+    # Primär: geglätteter Winkel
+    angle_rad = data.get("smoothed_angle_rad")
+    if angle_rad is not None:
+        return float(angle_rad), "angle_rad"
+
+    # Fallback: geglättete Normierung der u-Position
+    u_norm = data.get("smoothed_u_norm")
+    if u_norm is not None:
+        return float(u_norm), "u_norm"
+    return None, None
+
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 # --- PID-Regelung zum gieren ---
 def compute_pid(signal, dt, source):
     """
-    PID-Regler. Fehler = -signal (Ziel: 0).
-    signal = angle_rad (oder u_norm als Fallback).
+    PID-Regler mit Hysterese.
+    signal = angle_rad oder u_norm (als Fallback).
+    Fehler = -signal (Ziel: 0).
     """
-    global integrator, prev_error, deriv_filtered
+    global integrator, prev_error, deriv_filtered, inside_dead_angle, inside_dead_unorm
 
     error = -signal
 
-    # Deadband je nach Quelle
-    deadband = DEADBAND_ANGLE if source == "angle_rad" else DEADBAND_UNORM
-    if abs(signal) < deadband:
-        integrator *= 0.0
-        prev_error = 0.0
-        deriv_filtered = 0.0
-        return 0.0
+    # Hysterese je nach Quelle
+    if source == "angle_rad":
+        if abs(signal) < ANGLE_INNER:
+            inside_dead_angle = True
+        elif abs(signal) > ANGLE_OUTER:
+            inside_dead_angle = False
+
+        if inside_dead_angle:
+            # Ruhezone: nichts regeln, Integrator NICHT löschen (freeze)
+            integrator = 0.0
+            prev_error = 0.0
+            deriv_filtered = 0.0
+            return 0.0
+
+    else:  # Fallback u_norm
+        if abs(signal) < UNORM_INNER:
+            inside_dead_unorm = True
+        elif abs(signal) > UNORM_OUTER:
+            inside_dead_unorm = False
+
+        if inside_dead_unorm:
+            integrator = 0.0
+            prev_error = 0.0
+            deriv_filtered = 0.0
+            return 0.0
 
     # P
     P = Kp * error
@@ -102,21 +145,7 @@ def compute_pid(signal, dt, source):
     yaw = clamp(yaw, -MAX_YAW, MAX_YAW)
     return yaw
 
-# --- PID-relevante Werte extrahieren ---
-def extract_angle_or_unorm(data):
-    if data is None:
-        return None, None
-
-    # Primär: geglätteter Winkel
-    angle_rad = data.get("smoothed_angle_rad")
-    if angle_rad is not None:
-        return float(angle_rad), "angle_rad"
-
-    # Fallback: geglättete Normierung der u-Position
-    u_norm = data.get("smoothed_u_norm")
-    if u_norm is not None:
-        return float(u_norm), "u_norm"
-    return None, None
+# ----------------- Hauptloop -----------------
 
 try:
     while True:
@@ -134,7 +163,7 @@ try:
             continue
 
         # Ausgabe
-        if data is not None:
+        if data is not None and args.verbose:
             dets = [data] if isinstance(data, dict) else data
             for i, d in enumerate(dets):
                 track_id    = d.get("track_id")
@@ -144,11 +173,10 @@ try:
                 angle_deg   = d.get("smoothed_angle_deg")
                 z_mm        = d.get("smoothed_z_mm")
 
-                if args.verbose:
-                    print(f"[INFO] Det {i}: ID={track_id} || Angle_rad={angle_rad:.2f} || U_norm={u_norm:.2f} || Z_mm={z_mm:.0f}mm")
+                print(f"[INFO] Det {i}: ID={track_id} || Angle_rad={angle_rad:.2f} || U_norm={u_norm:.2f} || Z_mm={z_mm:.0f}mm")
         else:
             print("[INFO] Keine Detektionen im Payload.")
-        '''
+
         # PID auf Winkel
         angle, source = extract_angle_or_unorm(data)
         if angle is None:
@@ -176,7 +204,7 @@ try:
                 print(f"[INFO] yaw_cmd={yaw_cmd:.3f}")
         except Exception as e:
             print(f"[WARN] udp.Send gescheitert: {e}")
-        '''
+        
 except KeyboardInterrupt:
     print("\n[INFO] Durch Benutzer beendet. Sende Stopp-Befehl an Roboter.")
     try:

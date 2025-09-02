@@ -72,8 +72,8 @@ model = YOLOv8TensorRT(
     engine_path="./models/trained_yolov8n.engine",
     input_width=480,
     input_height=416,
-    conf_thresh=0.4,
-    iou_thresh=0.5,
+    conf_thresh=0.25,
+    iou_thresh=0.45,
 )
 CLASS_NAMES = ["bottle", "can"]
 
@@ -155,7 +155,7 @@ def build_processed_detections(raw_dets, class_names):
 
 # --- Bounding Boxes paaren (Stereo-Matching links/rechts) und Disparitätsberechnung ---
 def match_bboxes(processed_left, processed_right, fx, baseline_mm,
-                 max_v_diff=8.5, height_ratio_thresh=(0.75, 1.25), z_range_mm=(100, 900)):
+                 max_v_diff=8.5, height_ratio_thresh=(0.75, 1.25), z_range_mm=(100, 1100)):
     matches = []
     used = set()
 

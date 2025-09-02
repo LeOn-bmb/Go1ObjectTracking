@@ -37,42 +37,49 @@ class YOLOv8TensorRT:
     def preprocess(self, image):
         # BGR → RGB (Training auf RGB)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
         h0, w0 = image.shape[:2]
-        r = min(self.input_height / h0, self.input_width / w0)
-        new_unpad = int(round(w0 * r)), int(round(h0 * r))  # (new_w, new_h)
 
-        # Resize mit Aspect Ratio
-        resized = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
+        # Verhältnis berechnen, damit Aspect Ratio erhalten bleibt
+        r = min(self.input_width / w0, self.input_height / h0)
+        new_w, new_h = int(round(w0 * r)), int(round(h0 * r))
+
+        # Resize
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
         # Padding berechnen
-        dw = self.input_width - new_unpad[0]
-        dh = self.input_height - new_unpad[1]
+        dw = self.input_width - new_w
+        dh = self.input_height - new_h
+        top, bottom = dh // 2, dh - dh // 2
+        left, right = dw // 2, dw - dw // 2
 
-        top = int(round(dh / 2 - 0.1))
-        bottom = int(round(dh / 2 + 0.1))
-        left = int(round(dw / 2 - 0.1))
-        right = int(round(dw / 2 + 0.1))
+        # Letterbox mit grauem Hintergrund
+        padded = cv2.copyMakeBorder(resized, top, bottom, left, right,
+                                    cv2.BORDER_CONSTANT, value=(114, 114, 114))
 
-        padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-
+        # Normalisierung auf [0,1]
         img = padded.astype(np.float32) / 255.0
+
+        # Channel-First
         img = img.transpose(2, 0, 1)
+
+        # Batch-Dimension hinzufügen
         img = np.expand_dims(img, axis=0)
-        return img.ravel()
+        return img.ravel(), (r, left, top)
 
 
     def infer(self, image):
-        self.host_input[:] = self.preprocess(image)
+        img, ratio_pad = self.preprocess(image)   # entpacken
+        self.host_input[:] = img.ravel()          # nur das Bild kopieren
         cuda.memcpy_htod(self.d_input, self.host_input)
         self.context.execute_v2(self.bindings)
         cuda.memcpy_dtoh(self.host_output, self.d_output)
-        return self.postprocess(self.host_output, image.shape)
+        return self.postprocess(self.host_output, image.shape, ratio_pad)
 
-    def postprocess(self, output, original_shape):
-        output = np.asarray(self.host_output).reshape(6, -1).T  # (4095, 6)
+    def postprocess(self, output, original_shape, ratio_pad):
+        r, pad_x, pad_y = ratio_pad
+        output = np.asarray(self.host_output).reshape(1, 6, -1)
+        output = np.squeeze(output, axis=0).T   # (4095, 6)
 
-        # Jetzt enthält jede Zeile: x, y, w, h, conf, class_id
         boxes = output[:, :4]
         confidences = output[:, 4]
         class_ids = output[:, 5].astype(int)
@@ -90,25 +97,24 @@ class YOLOv8TensorRT:
         boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
         boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
 
-        # Skalierung auf Originalbildgröße
-        h_orig, w_orig = original_shape[:2]
-        boxes_xyxy[:, [0, 2]] *= w_orig / self.input_width
-        boxes_xyxy[:, [1, 3]] *= h_orig / self.input_height
+        # Rückskalierung auf Originalbild
+        boxes_xyxy[:, [0, 2]] = (boxes_xyxy[:, [0, 2]] - pad_x) / r
+        boxes_xyxy[:, [1, 3]] = (boxes_xyxy[:, [1, 3]] - pad_y) / r
 
-        # Clipping auf Bildränder
+        # Clipping
+        h_orig, w_orig = original_shape[:2]
         boxes_xyxy[:, 0] = np.clip(boxes_xyxy[:, 0], 0, w_orig)
         boxes_xyxy[:, 1] = np.clip(boxes_xyxy[:, 1], 0, h_orig)
         boxes_xyxy[:, 2] = np.clip(boxes_xyxy[:, 2], 0, w_orig)
         boxes_xyxy[:, 3] = np.clip(boxes_xyxy[:, 3], 0, h_orig)
 
-        # Einbauen der NMS
+        # NMS
         if len(boxes_xyxy) > 0:
             keep = self.nms(boxes_xyxy, confidences, self.iou_thresh)
             boxes_xyxy = boxes_xyxy[keep]
             confidences = confidences[keep]
             class_ids = class_ids[keep]
 
-        # Ergebnisse zusammensetzen
         result = []
         for i in range(len(boxes_xyxy)):
             box = boxes_xyxy[i]
