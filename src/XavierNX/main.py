@@ -103,12 +103,12 @@ track_palette = [(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,2
                          (64,64,64), (192,192,192), (255,165,0), (75,0,130), (255,20,147)]
 
 # Glättungsfaktoren / EWMA Faktor 0..1 -> höher = reaktiver, niedriger = ruhiger
-ALPHA_U_TRACK = 0.7             # Glättung für u_px (horizontale Position)
-ALPHA_RAD_TRACK = 0.6           # Glättung für angle_rad (Winkel)
+ALPHA_U_TRACK = 0.6             # Glättung für u_px (horizontale Position)
+ALPHA_RAD_TRACK = 0.5           # Glättung für angle_rad (Winkel)
 ALPHA_Z_TRACK = 0.4             # Glättung für z_mm (Distanz)
 
 # --- Timeout für das Senden an den Raspberry Pi ---
-STALE_TIMEOUT = 7.0  # Sekunden ohne YOLO-Detection → nichts senden
+STALE_TIMEOUT = 5.0  # Sekunden ohne YOLO-Detection → nichts senden
 last_detection_time = time.time()
 last_valid_target = None
 stale_sent = False

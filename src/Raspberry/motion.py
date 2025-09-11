@@ -2,7 +2,8 @@
 ZeroMQ PULL Receiver + PID-basierte Yaw-Nachführung für Unitree (High-Level).
 - Empfängt JSON per ZeroMQ (vom Xavier NX)
 - Führt PID primär auf angle_rad aus (Fallback: u_norm) -> cmd.yawSpeed
-- Sendet HighCmd per robot_interface (UDP)
+- Führt eine einfache Hysterese-basierte Distanzregelung auf den Distanzwert z_mm aus-> cmd.velocity
+- Sendet HighCmd (High-Level Befehle) per robot_interface (UDP)
 """
 
 import zmq
@@ -40,25 +41,23 @@ cmd = sdk.HighCmd()
 state = sdk.HighState()
 udp.InitCmdData(cmd)
 
+cmd.gaitType = 1       # Walking
 cmd.mode = 2           # Geschwindigkeitsmode
-cmd.velocity[0] = 0.0
-cmd.velocity[1] = 0.0
+# Init Motion
+cmd.velocity = [0, 0]
 cmd.yawSpeed = 0.0
 
 # ---------- PID-Zustand ----------
-Kp = 1.0
-Ki = 0.3
-Kd = 0.02
-
+Kp = 0.6
+Ki = 0.2
+Kd = 0.03
 MAX_YAW = 0.6               # Max yawSpeed (rad/s)
 
 #  Hysterese-Schwellen 
 ANGLE_INNER = 0.07    # rad (~4°) -> "gut genug zentriert"
 ANGLE_OUTER = 0.1     # rad (~5.7°) -> erst dann wieder aktiv werden
-
 UNORM_INNER = 0.03    # norm (~3%) 
 UNORM_OUTER = 0.04    # norm (~4%)
-
 # Hysterese-Zustände merken
 inside_dead_angle = False
 inside_dead_unorm = False
@@ -70,7 +69,21 @@ integrator_limit = MAX_YAW * 2.0  # Anti-Windup
 deriv_filtered = 0.0
 deriv_tau = 0.02
 
-# --- PID-relevante Werte extrahieren ---
+# ---------- Distanz-Parameter ----------
+DIST_TARGET = 600.0     # mm
+DIST_TOL_INNER = 40.0   # mm
+DIST_TOL_OUTER = 70.0   # mm
+MAX_FWD_SPEED = 0.4     # m/s (vorwärts/rückwärts)
+# Hysterese-Zustände für Distanz
+inside_dead_dist = False
+
+# Glättung für von Fallback in z_mm vorhanden
+last_forward_cmd = 0.0
+ALPHA_FWD = 0.3  # Glättung (0..1)
+
+# ----------------- Gieren -----------------
+
+# PID-relevante Werte extrahieren
 def extract_angle_or_unorm(data):
     if data is None:
         return None, None
@@ -89,7 +102,7 @@ def extract_angle_or_unorm(data):
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-# --- PID-Regelung zum gieren ---
+# PID-Regelung
 def compute_pid(signal, dt, source):
     """
     PID-Regler mit Hysterese.
@@ -109,7 +122,6 @@ def compute_pid(signal, dt, source):
 
         if inside_dead_angle:
             # Ruhezone: nichts regeln, Integrator NICHT löschen (freeze)
-            integrator = 0.0
             prev_error = 0.0
             deriv_filtered = 0.0
             return 0.0
@@ -145,6 +157,64 @@ def compute_pid(signal, dt, source):
     yaw = clamp(yaw, -MAX_YAW, MAX_YAW)
     return yaw
 
+# ----------------- Distanzregelung -----------------
+
+def smooth_speed(new_speed):
+    global last_forward_cmd
+    last_forward_cmd = (1 - ALPHA_FWD) * last_forward_cmd + ALPHA_FWD * new_speed
+    return last_forward_cmd
+
+
+def compute_forward_speed(data):
+    """
+    Einfache Hysterese-basierte Distanzregelung.
+    """
+    global inside_dead_dist
+    z_mm = data.get("smoothed_z_mm")
+    angle_rad = data.get("smoothed_angle_rad")
+
+    if z_mm is None:
+            # Kein Stereo-Match verfügbar. Fallback: nur dann langsam vorwärts gehen, wenn wir bereits gut genug ausgerichtet sind.
+        if angle_rad is not None and inside_dead_angle or inside_dead_unorm:
+            return 0.05   # langsam vorwärts, um Stereo-Match zu provozieren
+        else:
+            return 0.0   # warten bis ausgerichtet
+
+    # --- Sicherheitsfenster ---
+    if z_mm < 400:
+        # zu nah → langsam zurück
+        return clamp(-0.05, -MAX_FWD_SPEED, MAX_FWD_SPEED)
+
+    if z_mm > 800:
+        # zu weit weg → langsam vor
+        return clamp(0.05, -MAX_FWD_SPEED, MAX_FWD_SPEED)
+    
+    # --- Einregelung auf Ziel ---
+    error = float(z_mm) - DIST_TARGET  # >0: zu weit weg, <0: zu nah
+
+    # Hysterese
+    if abs(error) <= DIST_TOL_INNER:
+        inside_dead_dist = True
+    elif abs(error) > DIST_TOL_OUTER:
+        inside_dead_dist = False
+
+    if inside_dead_dist:
+        return 0.0  # Ruhezone
+    else:
+        # proportional steuern, Geschwindigkeit begrenzen
+        if error < 0:
+            k = 0.001  # sanfter rückwärts
+        else:
+            k = 0.002  # schneller vorwärts
+
+        speed = k * error
+
+        # --- Zusatz: weich abbremsen, wenn < 500 mm ---
+        if z_mm < 500:
+            speed = min(speed, 0.1)  # maximal 0.1 m/s vorwärts
+
+        return clamp(speed, -MAX_FWD_SPEED, MAX_FWD_SPEED)
+
 # ----------------- Hauptloop -----------------
 
 try:
@@ -153,6 +223,7 @@ try:
         try:
             msg = socket.recv(flags=zmq.NOBLOCK)
         except zmq.Again:
+            time.sleep(0.005)
             continue
 
         # JSON decodieren
@@ -189,19 +260,19 @@ try:
         prev_time = now
         last_detection_time = now
 
+        # Forward Geschwindigkeit auf Distanz
+        forward_cmd = smooth_speed(compute_forward_speed(data))
+
         # HighCmd setzen & senden
         cmd.mode = 2
-        cmd.velocity[0] = 0.0
-        cmd.velocity[1] = 0.0
-        cmd.yawSpeed = float(yaw_cmd)
+        cmd.velocity = [forward_cmd, 0]     # [vorwärts, seitwärts]
+        cmd.yawSpeed = float(yaw_cmd)       # Gieren
 
         try:
             udp.SetSend(cmd)
             udp.Send()
             if args.verbose:
-                print(f"[DEBUG] {source}={angle:.3f} -> yaw_cmd={yaw_cmd:.3f} rad/s")
-            else:
-                print(f"[INFO] yaw_cmd={yaw_cmd:.3f}")
+                print(f"[DEBUG] forward_cmd={forward_cmd:.2f} m/s, yaw_cmd={yaw_cmd:.3f} rad/s")
         except Exception as e:
             print(f"[WARN] udp.Send gescheitert: {e}")
         

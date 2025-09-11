@@ -31,7 +31,7 @@ Das System wurde für ressourcenbeschränkte Edge-Hardware wie den Jetson Xavier
 
 (auf Jetson Go1, Python ≥3.6)
 - OpenCV (≥4) - für Bildverarbeitung
-- CMake (≥3.11) - zum bauen von C-Anwendungen
+- CMake (≥3.27.9) - zum bauen von C-Anwendungen / Installation von cppzmq-Header-Paket (nötiges C++-Binding für ZeroMQ)
 - Python3.6+
 - [ZeroMQ](https://zeromq.org/get-started/) - leichtgewichtige Messaging-Library (Bildstreaming Nano → Xavier NX → Raspberry Pi)
   
