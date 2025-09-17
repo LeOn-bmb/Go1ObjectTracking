@@ -1,0 +1,725 @@
+"""
+Hauptskript:
+- Empfängt Bilder der Stereokamera (links & rechts) vom Jetson Nano
+- Erkennt Objekte und zeichnet Bounding Boxen
+- Bestimmt die Distanz zu den Objekten mittels Triangulation und Stereodisparität
+- Bietet optional Debug-Ausgaben (Anzeige der Bilder oder und Korrespondenzen, Aufzeichnung von Frames, FPS-Messung)
+- Sendet relevante, geglättete Bewegungsdaten an den Raspberry Pi
+"""
+
+from ultralytics import YOLO
+from collections import deque
+import zmq
+import cv2
+import math
+import numpy as np
+import struct
+import time
+import argparse
+import os
+import json
+
+# --- FPS-Messung Setup ---
+last_fps_time = time.time()
+frame_count = 0
+fps_outputs = 0       # Anzahl der ausgegebenen FPS-Werte
+seconds_elapsed = 0
+fps_list = []         # Array-Speicher für FPS-Werte
+
+size_printed = 0      #Frame-Size Debug einmalig
+
+# Header: uint32 left_size, left_width, left_height, left_type, right_size, right_width, right_height, right_type
+HEADER_FORMAT = "IIIIIIII"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+
+# --- ZeroMQ Context + Sockets ---
+context = zmq.Context()
+
+# ZeroMQ (PULL vom Nano)
+socket = context.socket(zmq.PULL)
+socket.setsockopt(zmq.RCVHWM, 4)
+socket.setsockopt(zmq.LINGER, 0)
+socket.bind("tcp://*:5555")  # auf Verbindung warten
+
+# Poller erzeugen
+poller = zmq.Poller()
+poller.register(socket, zmq.POLLIN)
+
+print("Empfänger bereit...")
+
+# ZeroMQ (PUSH zum Raspberry)
+robot_socket = context.socket(zmq.PUSH)
+robot_socket.setsockopt(zmq.SNDHWM, 15)   # max queued messages before dropping
+robot_socket.setsockopt(zmq.LINGER, 0)   # kein blockierendes Schließen
+robot_socket.connect(f"tcp://192.168.123.161:5560")
+
+# --- CLI Parser-Argumente definieren ---
+parser = argparse.ArgumentParser(description="Empfängt Bilder, führt Objekterkennung durch und führt optional Debugfunktionen aus.")
+parser.add_argument('--debug-view', choices=['left','right','both'],
+                    help='YOLO-Ergebnisse, Track-Ids und Distanz im linken, rechten oder beiden Bildern anzeigen')
+parser.add_argument('--debug-values', action='store_true',
+                    help='Bewegungswerte, die aus der smoothed_ an den Raspberry weitergeleitet werden (roh vs. geglättet)')
+parser.add_argument('--debug-size', action='store_true',
+                    help='Frame-Größen, Typen und Kalibrierungsparameter debuggen')
+parser.add_argument('--debug-fps', action='store_true',
+                    help='FPS-Messung ausgeben')
+parser.add_argument('--debug-img', metavar='imgname', 
+                    help='Dateiname für das zu speichernde Bild, dann wählbar l(eft), r(ight), c(ombined)')
+args = parser.parse_args()
+
+# --- Init YOLOv8 .pt-Modell ---
+model = YOLO("./models/trained_yolov8n.pt")
+CLASS_NAMES = ["bottle", "can"]
+
+# --- Kamera-Parameter (aus Kalibrierungsdatei) laden ---
+fs = cv2.FileStorage("camCalibParams.yaml", cv2.FILE_STORAGE_READ)
+if not fs.isOpened():
+    raise SystemExit("[FATAL] Konnte camCalibParams.yaml nicht öffnen. Pfad prüfen.")
+
+# linke kfe-Matrix und Translationsvektor auslesen
+left_kfe = fs.getNode("LeftKFE").mat()
+translation = fs.getNode("LeftTranslation").mat()
+fs.release()
+
+# Einzelwerte extrahieren
+fx = float(left_kfe[0, 0])                    # Fokalweite in Pixeln
+cx = float(left_kfe[0, 2])                    # Bildzentrum horizontal
+baseline_mm = float(abs(translation[0, 0]))   # Basislinie in mm
+
+# --- Tracking-Variablen ---
+track_states = {}  # Track-Status (id -> state dict)
+next_track_id = 0  # Nächste verfügbare Track-ID
+smooth_states = {} # geglättete Werte
+
+# Farbpalette für die Track-ID Disparitäten (RGB tuples)
+track_palette = [(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255),
+                         (128,0,0), (0,128,0), (0,0,128), (128,128,0), (128,0,128), (0,128,128),
+                         (64,64,64), (192,192,192), (255,165,0), (75,0,130), (255,20,147)]
+
+# Glättungsfaktoren / EWMA Faktor 0..1 -> höher = reaktiver, niedriger = ruhiger
+ALPHA_U_TRACK = 0.7             # Glättung für u_px (horizontale Position)
+ALPHA_RAD_TRACK = 0.6           # Glättung für angle_rad (Winkel)
+ALPHA_Z_TRACK = 0.4             # Glättung für z_mm (Distanz)
+
+# --- Timeout für das Senden an den Raspberry Pi ---
+STALE_TIMEOUT = 7.0  # Sekunden ohne YOLO-Detection → nichts senden
+last_detection_time = time.time()
+last_valid_target = None
+stale_sent = False
+
+# ----------------- Receive-Phase -----------------
+
+# --- Nur den neuesten Frame verarbeiten ---
+def get_latest_message(sock, poller, timeout_ms=5):
+    socks = dict(poller.poll(timeout_ms))
+    if socks.get(sock) != zmq.POLLIN:
+        return None
+
+    # Queue leeren, letzte Nachricht zurückgeben
+    last_msg = None
+    while True:
+        try:
+            last_msg = sock.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            break
+    return last_msg
+
+# ----------------- Detection-Phase -----------------
+
+# --- YOLO-Inferenz für Stereo-Bilder im Batch ---
+def run_inference(model, left_img, right_img):
+    def prep(img):
+        # sicherstellen dtype uint8
+        if img.dtype != np.uint8:
+            # falls float 0..1 → auf 0..255 skalieren, sonst cast
+            if img.dtype == np.float32 or img.dtype == np.float64:
+                img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
+            else:
+                img = img.astype(np.uint8)
+        # falls BGR (OpenCV) → zu RGB für ultralytics konvertieren
+        if img.ndim == 3 and img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
+
+    l = prep(left_img)
+    r = prep(right_img)
+
+    results = model([l, r])  # Batch-Inferenz
+    detections = []
+
+    for res in results:  # für jedes Bild im Batch
+        raw_dets = []
+        # res.boxes.xyxy / .conf / .cls sind Arrays/Tensoren der Länge N
+        xyxy = getattr(res.boxes, "xyxy", None)
+        confs = getattr(res.boxes, "conf", None)
+        clss = getattr(res.boxes, "cls", None)
+
+        if xyxy is None or len(xyxy) == 0:
+            detections.append([])
+            continue
+
+        # iteriere über Indizes (robust gegenüber verschiedenen Box-Objekt-APIs)
+        for i in range(len(xyxy)):
+            coords = xyxy[i].tolist()  # [x1,y1,x2,y2]
+            x1, y1, x2, y2 = map(float, coords)
+            conf = float(confs[i]) if confs is not None else 0.0
+            cls_id = int(clss[i]) if clss is not None else 0
+            raw_dets.append([x1, y1, x2, y2, conf, cls_id])
+
+        detections.append(raw_dets)
+
+    # sicherstellen, dass zwei Ergebnisse zurückgegeben werden
+    if len(detections) == 1:
+        return detections[0], []
+    elif len(detections) >= 2:
+        return detections[0], detections[1]
+    else:
+        return [], []
+
+# --- Bounding Boxes aufbauen  ---
+def build_processed_detections(raw_dets, class_names):
+    processed = []
+
+    for det in raw_dets:
+        x1, y1, x2, y2, conf, cls_id = det
+        # Bounding Box Mitte
+        u = (x1 + x2) / 2.0
+        v = (y1 + y2) / 2.0
+
+        processed.append({
+            'x1': int(x1), 'y1': int(y1),'x2': int(x2), 'y2': int(y2),
+            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+            'conf': float(conf),
+            'class_id': int(cls_id),
+            'class_name': class_names[int(cls_id)] if 0 <= int(cls_id) < len(class_names) else f"class_{int(cls_id)}",
+            'u_px': float(u),
+            'v_px': float(v)
+        })
+    return processed
+
+# --- Bounding Boxes paaren (Stereo-Matching links/rechts) und Disparitätsberechnung ---
+def match_bboxes(processed_left, processed_right, fx, baseline_mm,
+                 max_v_diff=8.5, height_ratio_thresh=(0.75, 1.25), z_range_mm=(100, 1100)):
+    matches = []
+    used = set()
+
+    # Erwartete Disparitätsspanne aus den bekannten Parametern
+    if fx is not None and baseline_mm is not None:
+        d_max = (fx * baseline_mm) / z_range_mm[0]  # nahes Objekt
+        d_min = (fx * baseline_mm) / z_range_mm[1]  # fernes Objekt
+        margin = 0.1  # 10 % Puffer
+        d_max *= (1 + margin)
+        d_min *= (1 - margin)
+    else:
+        d_min, d_max = None, None
+
+    # Für jede linke Box die beste rechte Box suchen
+    for i, det_left in enumerate(processed_left):
+        best = None
+        best_score = 1e9
+        best_j = -1
+
+        for j, det_right in enumerate(processed_right):
+            if j in used:
+                continue
+            # gleiche Klasse?
+            if det_left['class_id'] != det_right['class_id']:
+                continue
+            
+            vL, vR = det_left['v_px'], det_right['v_px']
+            hL = det_left['y2'] - det_left['y1']
+            hR = det_right['y2'] - det_right['y1']
+            v_diff = abs(vL - vR)
+            h_ratio = hL / max(hR, 1e-6)
+#            print(f"[DEBUG] Checking match y-Abweichung = {v_diff:.2f} px | Ratio: {h_ratio:.2f}")
+
+            # Filter: maximale v-Abweichung und Höhenverhältnis
+            if v_diff > max_v_diff:
+                continue
+            if not (height_ratio_thresh[0] <= h_ratio <= height_ratio_thresh[1]):
+                continue
+            # Disparität und Tiefenbereich prüfen
+            uL, uR = det_left['u_px'], det_right['u_px']
+            disp = abs(uL - uR)
+            if d_min is not None and (disp < d_min or disp > d_max):
+                continue
+            
+            # Beste Übereinstimmung anhand der Disparität zum erwarteten Wert
+            score = disp + 0.5 * v_diff + 0.5 * abs(1 - h_ratio) * hL
+            if score < best_score:
+                best_score = score
+                best = (det_left, det_right, disp)
+                best_j = j
+
+        if best is not None:
+            used.add(best_j)
+            # rechte Box im linken Detection speichern
+            det_left['right_bbox'] = best[1]['bbox']
+            matches.append(best)
+    return matches
+
+# ----------------- Tracking-Phase -----------------
+
+# --- Track-States aktualisieren (Zuordnung der Detections über Zeit) ---
+def update_tracks(matches, track_states, next_track_id, max_u_diff=30, max_v_diff=20, max_disp_history=20):
+    now = time.time()
+    used_tracks = set()
+    
+    for det_left, det_right, disp in matches:
+        uL, vL = det_left['u_px'], det_left['v_px']
+        best_tid, best_dist = None, None
+        
+        # Existierende Tracks prüfen
+        for tid, ts in track_states.items():
+            if tid in used_tracks:
+                continue
+            u_prev, v_prev = ts['left_center']
+            du, dv = abs(uL - u_prev), abs(vL - v_prev)
+            # Filter: maximale Abweichungen
+            if du <= max_u_diff and dv <= max_v_diff:
+                dist = du + dv
+                if best_dist is None or dist < best_dist:
+                    best_dist, best_tid = dist, tid
+        
+        if best_tid is not None:
+            # Existierender Track
+            ts = track_states[best_tid]
+            ts['left_center'] = (uL, vL)
+            ts['disparities'].append(disp)
+            ts['last_update'] = now
+            det_left['track_id'] = best_tid
+            det_right['track_id'] = best_tid
+            used_tracks.add(best_tid)
+        else:
+            # Neuer Track
+            track_states[next_track_id] = {
+                'left_center': (uL, vL),
+                'disparities': deque([disp], maxlen=max_disp_history),
+                'last_update': now
+            }
+            det_left['track_id'] = next_track_id
+            det_right['track_id'] = next_track_id
+            used_tracks.add(next_track_id)
+            next_track_id += 1
+    
+    # Alte Tracks entfernen
+    to_delete = [tid for tid, ts in track_states.items() if now - ts['last_update'] > 1.0]
+    for tid in to_delete:
+        del track_states[tid]
+    return track_states, next_track_id
+
+# --- Distanz aus Disparität berechnen ---
+def depth_from_disparity(track_states, fx, baseline_mm):
+    for tid, ts in track_states.items():
+        if 'disparities' in ts and ts['disparities']:
+            # Median für stabile Tiefe
+            disp_median = np.median(list(ts['disparities']))
+            z_mm = (fx * baseline_mm) / disp_median
+            ts['disp_median'] = disp_median
+            ts['z_mm'] = z_mm
+        else:
+            ts['disp_median'] = None
+            ts['z_mm'] = None
+
+#        print(f"[DEBUG] Track {tid}: disparities={list(ts['disparities'])}, disp_median={ts['disp_median']} | z_mm={ts['z_mm']}")
+    return track_states
+
+# ----------------- Target-Auswahl-Phase -----------------
+
+# Track mit der geringsten Distanz auswählen und rig-zentieren
+def select_target(track_states, fx, cx):
+    target = None
+    min_z = float('inf')
+    
+    # Track mit der geringsten Distanz auswählen 
+    for tid, ts in track_states.items():
+        if ts.get('z_mm') is None:
+            continue
+            
+        z_mm = ts['z_mm']
+        if z_mm < min_z:
+            min_z = z_mm
+            target = (tid, ts)
+
+    if target is None:
+        return None
+
+    tid, ts = target
+    uL, vL = ts['left_center']
+    disp = ts.get('disp_median')
+    if disp is None:
+        return None
+
+    # Rig-zentrierter Offset in Pixeln
+    u_rig = uL - 0.5 * disp
+    u_offset_px = float(u_rig - cx)
+
+    # Normierung auf -1..1
+    u_offset_norm = u_offset_px / cx
+
+    # Winkel berechnen (Radiant und Grad)
+    angle_rad = math.atan2(u_offset_px, fx)
+    angle_deg = math.degrees(angle_rad)
+
+    return {
+        'track_id': tid,
+        'u_offset_px': u_offset_px,     # rig-zentrierter Offset
+        'u_offset_norm': u_offset_norm, # normierter Offset
+        'angle_rad': angle_rad,         # Winkel in Radiant
+        'angle_deg': angle_deg,         # Winkel in Grad
+        'z_mm': z_mm,                   # Distanz
+    }
+# ----------------- Steuerungs-/Sende-Phase -----------------
+
+# Zielparameter mit EWMA glätten
+def smooth_target(target, smooth_states,
+                  alpha_u=ALPHA_U_TRACK,
+                  alpha_norm=ALPHA_U_TRACK,
+                  alpha_rad=ALPHA_RAD_TRACK,
+                  alpha_z=ALPHA_Z_TRACK):
+    if target is None:
+        return None, smooth_states 
+    
+    tid = target['track_id']
+    u_px, u_norm, angle_rad, z_mm = (
+        target['u_offset_px'],
+        target['u_offset_norm'],
+        target['angle_rad'],
+        target['z_mm']
+    )
+    
+    # # State nur für das aktuelle Target verwalten / Erster Eintrag: Initialisierung
+    if tid not in smooth_states:
+        smooth_states.clear()
+        smooth_states[tid] = {
+            'u_offset_px': u_px,
+            'u_offset_norm': u_norm,
+            'angle_rad': angle_rad,
+            'z_mm': z_mm
+        }
+    else:
+        # EWMA Glättung
+        prev = smooth_states[tid]
+        smooth_states[tid]['u_offset_px']   = alpha_u * u_px + (1 - alpha_u) * prev['u_offset_px']
+        smooth_states[tid]['u_offset_norm'] = alpha_norm * u_norm + (1 - alpha_norm) * prev['u_offset_norm']
+        smooth_states[tid]['angle_rad']     = alpha_rad * angle_rad + (1 - alpha_rad) * prev['angle_rad']
+        smooth_states[tid]['z_mm']          = alpha_z * z_mm + (1 - alpha_z) * prev['z_mm']
+
+    # Geglättete Werte zurückgeben für Steuerung
+    smoothed = {
+        'track_id': tid,
+        'smoothed_u': smooth_states[tid]['u_offset_px'],
+        'smoothed_u_norm': smooth_states[tid]['u_offset_norm'],
+        'smoothed_angle_rad': smooth_states[tid]['angle_rad'],
+        'smoothed_angle_deg': math.degrees(smooth_states[tid]['angle_rad']),
+        'smoothed_z_mm': smooth_states[tid]['z_mm']
+    }
+    return smoothed, smooth_states
+
+# Target (Track mit der geringsten Distanz) an den Raspberry Pi senden
+def send_motionValues(robot_socket, smoothed_target, target, 
+                      stale_timeout=STALE_TIMEOUT):
+
+    global last_detection_time, last_valid_target, stale_sent
+
+    if target and smoothed_target:
+        # Neue Detection vorhanden → aktuelle Werte senden
+        try:
+            robot_socket.send_json(smoothed_target, flags=zmq.NOBLOCK)
+            last_detection_time = time.time()
+            last_valid_target = smoothed_target
+            stale_sent = False
+        except zmq.Again:
+            print("[WARN] Sendepuffer voll – smoothed_target wurde verworfen")
+        except Exception as e:
+            print(f"Fehler beim Senden an Raspberry: {e}")
+    else:
+        # Keine aktuelle Detection → prüfen ob Timeout erreicht
+        elapsed = time.time() - last_detection_time
+
+        if elapsed <= stale_timeout and last_valid_target is not None:
+            # Innerhalb des Timeouts → letzten gültigen Wert weitersenden
+            try:
+                robot_socket.send_json(last_valid_target, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                print("[WARN] Sendepuffer voll – last_valid_target wurde verworfen")
+        elif elapsed > stale_timeout and not stale_sent:
+            # Timeout überschritten → einmalig STOP senden
+            try:
+                robot_socket.send_json(None, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                print("[WARN] Sendepuffer voll – STOP wurde verworfen")
+            print(f"[STALE] Keine YOLO-Detektion seit {elapsed:.1f}s → Stop an Roboter")
+            stale_sent = True
+
+# ----------------- Debugfunktionen -----------------
+
+# --- Bounding Boxes inkl. Abstand (z_mm falls vorhanden) zeichnen ---
+def draw_processed_detections(img, detections, side='left', color=(0,255,0), track_states=None):
+    # --- Beide Bilder nebeneinander zeichnen ---
+    if side == "both":
+        left_img, right_img = img  # Tuple entpacken
+        left_dets = detections.get("left", [])
+
+        # Rekursive Aufrufe für beide Seiten
+        left_img = draw_processed_detections(left_img, detections["left"], side="left", color=(0,255,0), track_states=track_states)
+        right_img = draw_processed_detections(right_img, detections["right"], side="right", color=(255,200,0), track_states=track_states)
+        # Beide Bilder nebeneinander kombinieren
+        combined = np.hstack((left_img, right_img))
+        
+        # Disparity-Linien zwischen korrespondierenden Detections zeichnen
+        for det_left in left_dets:
+            if 'track_id' in det_left and 'right_bbox' in det_left:
+                tid = det_left['track_id']
+                # Index der Farbe im Palette-Rad
+                col = track_palette[tid % len(track_palette)]
+                # Mittelpunkt links/rechts
+                uL, vL = int(det_left['u_px']), int(det_left['v_px'])
+                uR = int(det_left['right_bbox'][0] + (det_left['right_bbox'][2]-det_left['right_bbox'][0])/2)
+                vR = vL # rektifiziert → gleiche v-Koordinate
+                # Linie zeichnen (linkes Bild → rechtes Bild)
+                cv2.line(combined, (uL, vL), (uR + left_img.shape[1], vR), col, 2)
+        return combined
+
+    # --- Einzelbild Fall (left oder right) ---
+    for det in detections:
+        x1, y1, x2, y2 = det['bbox']
+        cls_name = det.get('class_name', "obj")
+        conf = det.get('conf', 0.0)
+        u, v = int(det['u_px']), int(det['v_px'])
+
+        # Bounding Box
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        # Mittelpunkt
+        cv2.circle(img, (u, v), 4, (0, 0, 255), -1)
+        # Label
+        label = f"{cls_name} {conf:.2f}"
+        # Track-ID anzeigen
+        if 'track_id' in det:
+            tid = det['track_id']
+            label = f"ID:{tid}"
+            # Distanz aus Track-States
+            if track_states is not None:
+                ts = track_states.get(tid)
+                if ts is not None and 'z_mm' in ts and ts['z_mm'] is not None:
+                    label += f" | z={ts['z_mm']:.0f}mm"
+
+        cv2.putText(img, label, (x1, max(0, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    return img
+
+# Frame-Größe & Typen debuggen
+def print_debug_frame_info(left_width, left_height, right_width, right_height, left_type, right_type):
+    print(f"Left Frame: {left_width}x{left_height} | Right Frame: {right_width}x{right_height}")
+    print(f"Empfangener left_type: {left_type}, expected: {cv2.CV_8UC3}")
+    print(f"Empfangener right_type: {right_type}, expected: {cv2.CV_8UC3}") 
+    print(f"Kamerakalibrierung: fx={fx}, cx={cx}, baseline={baseline_mm:.3f} mm")
+
+# FPS-Anzeige und Messung
+def update_fps_counter(frame_count, last_fps_time, seconds_elapsed, fps_outputs, fps_list):
+    now = time.time()
+    elapsed = now - last_fps_time
+
+    if elapsed >= 1.0:
+        seconds_elapsed += 1
+        last_fps_time = now
+
+        if args.debug_fps and seconds_elapsed >= 5 and fps_outputs < 15:
+            print(f"Sekunde {seconds_elapsed - 4}: FPS = {frame_count}")
+            fps_list.append(frame_count)
+            fps_outputs += 1
+
+        frame_count = 0
+
+        if args.debug_fps and fps_outputs == 15:
+            avg_fps = sum(fps_list) / len(fps_list)
+            print(f"\n✅ Durchschnittliche FPS über 15 Sekunden: {avg_fps:.2f}")
+
+    return frame_count, last_fps_time, seconds_elapsed, fps_outputs       
+
+# PNG-Aufnahme
+def capture_frame(img, filename):
+    # Sicherstellen, dass der Dateiname auf .png endet
+    if not filename.lower().endswith('.png'):
+        filename = os.path.splitext(filename)[0] + '.png'
+    try:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        base, ext = os.path.splitext(filename)
+        filename_with_timestamp = f"{base}_{timestamp}{ext}"
+        cv2.imwrite(filename_with_timestamp, img)
+        print(f"Bild gespeichert als: {filename_with_timestamp}")
+    except Exception as e:
+        print(f"Fehler beim Speichern: {e}")
+
+# ----------------- Hauptloop -----------------
+
+try:
+    while True:
+        # Nachricht erhalten
+        message = get_latest_message(socket, poller, timeout_ms=15)
+        if message is None:
+            continue
+
+        # Header extrahieren
+        header_data = message[:HEADER_SIZE]
+        (
+                left_size,
+                left_width,
+                left_height,
+                left_type,
+                right_size,
+                right_width,
+                right_height,
+                right_type,
+        ) = struct.unpack(HEADER_FORMAT, header_data)
+
+        # Bilddaten extrahieren
+        left_data = message[HEADER_SIZE:HEADER_SIZE + left_size]
+        right_data = message[HEADER_SIZE + left_size : HEADER_SIZE + left_size + right_size]
+
+        # Mapping OpenCV-Typ → (NumPy-Datentyp, Shape-Dimensionen)
+        opencv_type_map = {
+            cv2.CV_8UC1: (np.uint8, 1),
+            cv2.CV_8UC3: (np.uint8, 3),
+            cv2.CV_16UC1: (np.uint16, 1),
+            cv2.CV_32FC1: (np.float32, 1),
+        }
+
+        if left_type in opencv_type_map and right_type in opencv_type_map:
+            left_dtype, left_channels = opencv_type_map[left_type]
+            right_dtype, right_channels = opencv_type_map[right_type]
+
+            try:
+                if left_channels == 1:
+                    left_img = np.frombuffer(left_data, dtype=left_dtype).reshape((left_height, left_width))
+                else:
+                    left_img = np.frombuffer(left_data, dtype=left_dtype).reshape((left_height, left_width, left_channels))
+
+                if right_channels == 1:
+                    right_img = np.frombuffer(right_data, dtype=right_dtype).reshape((right_height, right_width))
+                else:
+                    right_img = np.frombuffer(right_data, dtype=right_dtype).reshape((right_height, right_width, right_channels))
+
+            except ValueError as e:
+                print(f"Fehler beim Umformen der Bilder: {e}")
+                continue
+        else:
+            print(f"[WARN] Unbekannter OpenCV-Typ: left_type={left_type}, right_type={right_type}")
+            continue
+
+        # beschreibbare Kopie der Bilder erzeugen
+        left_img = left_img.copy()
+        right_img = right_img.copy()
+
+
+        # --- YOLO-Inferenz auf beiden Bildern mit YOLOv8 Ultrtalytics YOLOv8 (.pt-Modell) ---
+        detections_for_processing = []  # Liste zum Zeichnen
+        payload = None                  # fürs Robot-Command
+
+        try:
+            raw_dets_left, raw_dets_right = run_inference(model, left_img, right_img)
+        except Exception as e:
+            raw_dets_left, raw_dets_right = [], []
+            print(f"[WARN] model(batch) failed: {e}")
+
+        # Aufbereitung der Detections
+        processed_left = build_processed_detections(raw_dets_left, CLASS_NAMES)
+        processed_right = build_processed_detections(raw_dets_right, CLASS_NAMES)
+
+        # --- Stereo-Matching der Bounding Boxes ---
+        matches = match_bboxes(processed_left, processed_right, fx=fx, baseline_mm=baseline_mm)
+
+        # Track-Update
+        track_states, next_track_id = update_tracks(matches, track_states, next_track_id)
+
+        # --- Tiefenberechnung für alle aktiven Tracks ---
+        track_states = depth_from_disparity(track_states, fx, baseline_mm)
+        
+        # --- Zielauswahl (Track mit geringster Distanz) ---
+        target = select_target(track_states, fx, cx)
+        
+        # --- Zielparameter glätten ---
+        smoothed_target, smooth_states = smooth_target(target, smooth_states)
+
+        # --- Parameter senden ---
+        send_motionValues(robot_socket, smoothed_target, target)
+
+        # --- Ergebniszeichnung ---
+        # YOLO-Detections
+        left_img = draw_processed_detections(left_img, detections_for_processing)
+        right_img = draw_processed_detections(right_img, detections_for_processing)
+
+# ----------------- CLI-Argumente für Debug-Ausgaben nutzen -----------------
+
+        # YOLO-Detections
+        if args.debug_view:
+            if args.debug_view == 'left':
+                left_img = draw_processed_detections(
+                    left_img, processed_left, side='left', color=(0,255,0), track_states=track_states)
+                cv2.imshow("YOLO Detections Left", left_img)
+
+            elif args.debug_view == 'right':
+                right_img = draw_processed_detections(
+                    right_img, processed_right, side='right', color=(255,200,0), track_states=track_states)
+                cv2.imshow("YOLO Detections Right", right_img)
+
+            elif args.debug_view == 'both':
+                combined = draw_processed_detections(
+                    (left_img, right_img),
+                    {"left": processed_left, "right": processed_right},
+                    side='both', track_states=track_states)
+                cv2.imshow("YOLO Detections Both", combined)
+        
+        # Debug-Ausgabe
+        if args.debug_values and target and smoothed_target:
+            print(
+                f"[TRACK {target['track_id']}] "
+                f"angle: raw={target['angle_rad']:.2f}rad, {target['angle_deg']:.1f}° | smooth={smoothed_target['smoothed_angle_rad']:.2f}rad, {smoothed_target['smoothed_angle_deg']:.1f}° || "
+                f"offset: raw={target['u_offset_px']:.1f}px | smooth={smoothed_target['smoothed_u']:.1f}px || "
+                f"normierter offset: raw={target['u_offset_norm']:.2f} | smooth={smoothed_target['smoothed_u_norm']:.2f} || "
+                f"z: raw={target['z_mm']:.0f}mm | smooth={smoothed_target['smoothed_z_mm']:.0f}mm || "
+            )
+
+        # Frame-Size Debug (einmalig)
+        if args.debug_size and size_printed == 0:
+            print_debug_frame_info(left_width, left_height, right_width, right_height, left_type, right_type)
+            size_printed = 1
+
+        # FPS-Zähler
+        if args.debug_fps:
+            frame_count += 1
+            frame_count, last_fps_time, seconds_elapsed, fps_outputs = update_fps_counter(
+                frame_count, last_fps_time, seconds_elapsed, fps_outputs, fps_list
+            )
+
+        # --- Draw Detections für (both-)Aufnahme vorbereiten ---
+        display_img = draw_processed_detections(
+            (left_img, right_img), 
+            detections={"left": processed_left, "right": processed_right}, 
+            side="both", 
+            track_states=track_states
+        )
+
+        # Tastendruck für Debug-Aufnahmen
+        key = cv2.waitKey(1) & 0xFF
+        if args.debug_img and key in [ord('l'), ord('r'), ord('c')]:
+            if key == ord('l'):
+                capture_frame(left_img, args.debug_img)
+            elif key == ord('r'):
+                capture_frame(right_img, args.debug_img)
+            elif key == ord('c'):
+                capture_frame(display_img, args.debug_img)
+        
+        # --- Escape-Taste zum Beenden ---
+        if key == 27:  # ESC
+            break
+except KeyboardInterrupt:
+    print("\nBeendet durch Benutzer (KeyboardInterrupt).")
+except Exception as e:
+    print(f"[FATAL] Unerwarteter Fehler: {e}")
+finally:
+    # --- Aufräumen ---
+    socket.close()
+    robot_socket.close()
+    context.term()
+    cv2.destroyAllWindows()
