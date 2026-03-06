@@ -51,7 +51,58 @@ Diese Abbildung zeigt die modulare Systemarchitektur verteilt auf die drei Reche
 - [TensorRT](https://developer.nvidia.com/tensorrt) - NVIDIA-Inferenz-Bibliothek, die speziell für NVIDIA GPUs die maximale Inferenz-Performance aus ONNX-Modellen herausholt (z. B. Version 7.1.3.0 unter JetPack 4.5)
 - [PyCUDA](https://wiki.tiker.net/PyCuda/Installation/Linux/) – für Memory Binding, CUDA Streams mit TensorRT & Speicherverwaltung in GPU
 
-📁 5. Build 
+📊 5. Performance & Benchmarks
+---
+
+Die Performance wurde auf dem **Jetson Xavier NX** gemessen mit verschiedenen YOLOv8-Modellvarianten. Alle Tests nutzen **TensorRT-Inference** für optimale Geschwindigkeit.
+
+### Modell-Vergleich (Xavier NX mit TensorRT)
+
+| YOLO-Modell | Inference (FPS) | mAP₀.₅ | mAP₀.₅:₀.₉₅ | Bemerkung |
+|-------------|-----------------|--------|------------|-----------|
+| **8n** | 24,47 | 0,0994 | 0,0666 | ⭐ Höchste FPS, gute Effizienz |
+| **8s** | 24,2 | 0,1058 | 0,065 | 📈 Höchste Genauigkeit |
+| **11n** | 24,4 | 0,079 | 0,0508 | Geringere Genauigkeit |
+| **11s** | 23,87 | 0,076 | 0,0505 | Etwas langsamer als 8n |
+| **8n (fine-tuned)** | 24,4 | **0,9848** | **0,8789** | 🎯 Fine-tuned auf Anwendungsdaten |
+
+**Empfehlungen:**
+- **Produktiv (Flaschen-Tracking)**: Fine-tuned YOLOv8n (mAP 0,98 - optimal für Anwendungsfall)
+- **Allgemein**: YOLOv8n (schnell & zuverlässig)
+- **High-Accuracy**: YOLOv8s (leicht bessere Genauigkeit, minimal langsamer)
+
+**Performance-Analyse:**
+
+Die Bildrate reduziert sich während der Datenübertragung, Objekterkennung und Tiefenschätzung von ursprünglich **27 FPS auf etwa 23 FPS** (nach Datenübertragung, Objekterkennung und Tiefenschätzung). Dieser Verlust von ~15% liegt im akzeptablen Bereich und gewährleistet die **Echtzeitfähigkeit des Systems**.
+
+### Praktische Ergebnisse in Aktion
+
+Das System erkennt Objekte zuverlässig und schätzt ihre Entfernung mittels Stereovision:
+
+<p align="center">
+  <img src="include/MethodenDiagramm.jpg" alt="Architekturdiagramm" width="750"/>
+  <br/>
+  <em>Abbildung 1: Architekturdiagramm des Go1-Stacks</em>
+</p>
+
+<p align="center">
+  <img src="include/object_detection_depth_estimation_demo.jpg" alt="Objekterkennung und Tiefenschätzung Demo" width="800"/>
+  <br/>
+  <em>Abbildung 2: Live-Demo - Objekterkennung (grün/blau) mit Tiefenschätzung in Millimetern</em>
+</p>
+
+**Erkenntnisse aus der Demo:**
+- ✅ **Mehrfach-Objekterkennung**: Es werden mehrere Flaschen erfasst
+- ✅ **Echtzeit-Tiefenschätzung**: Entfernungen werden live in Millimeter angezeigt
+- ✅ **Stereo-Disparität**: Unterschiedliche Abstände zwischen linkem (grün) und rechtem (blau) Bild sichtbar
+- ✅ **Robuste Erkennung**: Funktioniert auch unter variablen Lichtverhältnissen (Indoorbeleuchtung)
+
+**Farbcodierung:**
+- 🟢 **Grün**: Detektionen aus linker Kamera
+- 🔵 **Blau**: Detektionen aus rechter Kamera
+- **Zahlen**: Objekt-ID und Entfernung in Millimeter
+
+📁 6. Build 
 ---
 
 🔨 Bauen der C++-Anwendung auf dem Jetson Nano
@@ -62,7 +113,7 @@ cmake ..;
 make
 ```
 
-🏃 6. Run
+🏃 7. Run
 ---
 
 🎥 Kamera-Prozesse prüfen (Jetson Nano)
