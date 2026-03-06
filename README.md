@@ -80,13 +80,7 @@ Die Bildrate reduziert sich während der Datenübertragung, Objekterkennung und 
 Das System erkennt Objekte zuverlässig und schätzt ihre Entfernung mittels Stereovision:
 
 <p align="center">
-  <img src="include/MethodenDiagramm.jpg" alt="Architekturdiagramm" width="750"/>
-  <br/>
-  <em>Abbildung 1: Architekturdiagramm des Go1-Stacks</em>
-</p>
-
-<p align="center">
-  <img src="include/object_detection_depth_estimation_demo.jpg" alt="Objekterkennung und Tiefenschätzung Demo" width="800"/>
+  <img src="include/object_detection_depth_estimation_demo.png" alt="Objekterkennung und Tiefenschätzung Demo" width="750"/>
   <br/>
   <em>Abbildung 2: Live-Demo - Objekterkennung (grün/blau) mit Tiefenschätzung in Millimetern</em>
 </p>
