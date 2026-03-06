@@ -82,7 +82,7 @@ Das System erkennt Objekte zuverlässig und schätzt ihre Entfernung mittels Ste
 <p align="center">
   <img src="include/object_detection_depth_estimation_demo.png" alt="Objekterkennung und Tiefenschätzung Demo" width="750"/>
   <br/>
-  <em>Abbildung 2: Live-Demo - Objekterkennung (grün/blau) mit Tiefenschätzung in Millimetern</em>
+  <em>Abbildung 2: Live-Demo - Objekterkennung (grün/blau) mit Tiefenschätzung in Millimetern (s. Kapitel 7 --> Grafisches Debugging aktivieren) </em>
 </p>
 
 **Erkenntnisse aus der Demo:**
